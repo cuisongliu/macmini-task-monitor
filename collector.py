@@ -1,6 +1,5 @@
-"""读取 launchd 与现有凭据，逐项隔离故障；从不触发被监控任务。"""
+"""只读取当前用户的 launchd plist 和进程状态，不触发被监控任务。"""
 
-import copy
 import datetime as dt
 import hashlib
 import json
@@ -10,16 +9,14 @@ import re
 import socket
 import subprocess
 import time
-import tomllib
 from pathlib import Path
 
 import store
-from config import AGENTS, BACKUP_ROOT, METASO_ROOT, PR_ROOT, ROOT, SERVICES, TASKS, ZONE, redact, timestamp
+from config import AGENTS, ROOT, ZONE, redact
 from outcomes import scan_result_from_log
 
 
-def read_json(path):
-    return json.loads(path.read_text()) if path.exists() else {}
+SCRIPT_SUFFIXES = {'.py', '.sh', '.js', '.mjs', '.ts'}
 
 
 def command(args):
@@ -27,7 +24,7 @@ def command(args):
 
 
 def gui_states():
-    """launchctl list 的 PID 为 '-' 表示等待，不把已注册的定时任务误判为持续运行。"""
+    """launchctl list 的 PID 为 '-' 表示等待，不把已注册任务误判为正在运行。"""
     result = command(['launchctl', 'list'])
     if result.returncode:
         raise RuntimeError('无法读取当前用户的 launchd 状态')
@@ -41,149 +38,122 @@ def gui_states():
     return states
 
 
-def definitions():
-    """注册常用任务，并发现后续由 AI 添加的自建 launchd 定时任务。"""
-    tasks = copy.deepcopy(TASKS)
-    known = {task['label'] for task in tasks}
-    for path in sorted(AGENTS.glob('*.plist')):
+def is_monitor_definition(definition):
+    """避免把本看板自己的 KeepAlive LaunchAgent 展示成被监控任务。"""
+    for part in definition.get('ProgramArguments', []):
+        path = Path(part)
+        if path.is_absolute() and path.resolve() == ROOT / 'server.py':
+            return True
+    return False
+
+
+def script_path(definition):
+    arguments = definition.get('ProgramArguments') or []
+    candidates = [*arguments, definition.get('Program', '')]
+    for value in candidates:
+        if not isinstance(value, str) or not value.startswith('/'):
+            continue
+        path = Path(value)
+        if path.suffix.lower() in SCRIPT_SUFFIXES:
+            return value
+    return definition.get('Program', '')
+
+
+def read_definitions(directory=None):
+    """从当前用户的 LaunchAgents 目录发现定时任务与常驻服务。"""
+    directory = Path(directory or AGENTS)
+    tasks, services = [], []
+    try:
+        plist_paths = sorted(directory.glob('*.plist'))
+    except OSError:
+        return tasks, services
+    for path in plist_paths:
         try:
-            data = plistlib.loads(path.read_bytes())
+            definition = plistlib.loads(path.read_bytes())
         except (OSError, ValueError, plistlib.InvalidFileException):
             continue
-        if not isinstance(data, dict):
+        if not isinstance(definition, dict) or is_monitor_definition(definition):
             continue
-        label = data.get('Label', '')
-        if label in known or not (data.get('StartInterval') or data.get('StartCalendarInterval')):
-            continue
-        if not (label.startswith('com.yjl.') or label == 'com.google.GoogleUpdater.wake'):
-            continue
-        scripts = [part for part in data.get('ProgramArguments', []) if part.startswith('/') and re.search(r'\.(py|sh|js|mjs|ts)$', part)]
-        tasks.append({'id': label, 'label': label, 'name': 'Google 自动更新' if label.startswith('com.google.') else label,
-                      'icon': 'clock', 'source': 'launchd', 'category': 'system' if label.startswith('com.google.') else 'work',
-                      'description': '自动发现的 launchd 定时任务。', 'script': scripts[-1] if scripts else data.get('Program', ''),
-                      'log_paths': [data[key] for key in ('StandardOutPath', 'StandardErrorPath') if data.get(key)]})
-    return tasks
+        label = definition.get('Label') or path.stem
+        logs = [definition[key] for key in ('StandardOutPath', 'StandardErrorPath')
+                if isinstance(definition.get(key), str)]
+        common = {'id': label, 'label': label, 'name': definition.get('Name') or label,
+                  'description': '从当前用户的 LaunchAgents 自动发现。',
+                  'source': 'launchd', 'definition_path': str(path), 'log_paths': logs}
+        if definition.get('MiniMonitorKind') == 'timer' or definition.get('StartInterval') or definition.get('StartCalendarInterval'):
+            tasks.append({**common, 'icon': 'clock', 'category': 'work',
+                          'script': script_path(definition), 'source': 'launchd'})
+        elif definition.get('MiniMonitorKind') == 'service' or definition.get('KeepAlive'):
+            services.append({**common, 'domain': 'gui', 'description': '当前用户的 launchd 常驻服务。',
+                             'script': script_path(definition)})
+    return tasks, services
+
+
+def definitions(directory=None):
+    """兼容调用方，只返回定时任务定义。"""
+    return read_definitions(directory)[0]
 
 
 def import_record(data):
-    """稳定外部键用于重复采集去重；没有依据的开始时间和耗时保持为空。"""
+    """以稳定外部键导入已有凭据；不会执行来源任务。"""
     key = data['external_key']
     store.insert_run({'id': 'h-' + hashlib.sha256(key.encode()).hexdigest()[:24], 'kind': 'history', **data})
 
 
 def needs_receipt(task_id, event_time):
-    """无实时执行覆盖时补入业务凭据；扫描器补发日报也可留痕，避免同次执行双计。"""
+    """仅在同一时刻没有实时执行覆盖时允许导入一条外部凭据。"""
     with store.connect() as db:
         row = db.execute("SELECT 1 FROM runs WHERE task_id=? AND kind='execution' AND started_at<=? AND (finished_at>=? OR (status='running' AND heartbeat_at>=?)) LIMIT 1",
                          (task_id, event_time, event_time, event_time - 30)).fetchone()
     return row is None
 
 
-def backup_data():
-    records = []
-    backup_root = Path('/Volumes/code/backups/fastgpt')
-    if not backup_root.is_dir():
-        raise RuntimeError('备份目录不可用：' + str(backup_root))
-    for path in sorted(backup_root.glob('*/manifest.json')):
-        data = read_json(path)
-        if data.get('owner') != 'fastgpt-daily-backup-v1' or data.get('status') != 'complete':
-            continue
-        start, end = timestamp(data.get('started_at')), timestamp(data.get('completed_at'))
-        size = sum(item.get('bytes', 0) for item in data.get('files', []))
-        detail = {'备份日期': data.get('date'), '文件数量': len(data.get('files', [])), '总字节数': size,
-                  '备份目录': str(path.parent), '保留天数': 7, '时间精度': '原始清单的开始与结束时间'}
-        records.append({'date': data.get('date'), 'bytes': size, 'file_count': len(data.get('files', [])), 'completed_at': end, 'path': str(path.parent)})
-        if end and needs_receipt('fastgpt-backup', end):
-            import_record({'task_id': 'fastgpt-backup', 'external_key': 'backup:' + str(path), 'status': 'success',
-                           'created_at': start or end, 'started_at': start, 'finished_at': end, 'exit_code': None,
-                           'summary': 'MongoDB、PostgreSQL、MinIO 备份完成，校验通过', 'details': detail})
-    return {'backups': records[-7:], 'latest_backup': records[-1] if records else None}
-
-
 def scan_log_tail():
-    """有限读取扫描器原日志，为只有编号的旧凭据补充可核实的队列结果。"""
-    path = PR_ROOT / 'pr-poll.log'
-    if not path.is_file():
-        return ''
-    with path.open('rb') as stream:
-        stream.seek(max(0, path.stat().st_size - 48000))
-        return stream.read(48000).decode('utf-8', errors='replace')
-
-
-def pr_data():
-    data = read_json(PR_ROOT / 'queue-state.json')
-    counts = {}
-    active = []
-    for number, entry in data.get('entries', {}).items():
-        status = entry.get('status', 'unknown')
-        counts[status] = counts.get(status, 0) + 1
-        if status in ('queued', 'running', 'error'):
-            active.append({'pr': number, 'status': status, 'phase': entry.get('phase'), 'ready_at': entry.get('ready_at'), 'attempts': entry.get('attempts')})
-        end = entry.get('finished_at')
-        if end and status in ('processed', 'error') and needs_receipt('pr-worker', end):
-            import_record({'task_id': 'pr-worker', 'external_key': f'pr:{number}:{entry.get("attempt_id", end)}',
-                           'status': 'success' if status == 'processed' else 'failed',
-                           'created_at': entry.get('started_at') or end, 'started_at': entry.get('started_at'),
-                           'finished_at': end, 'exit_code': entry.get('exit_code'),
-                           'summary': f'PR #{number} · ' + ('已处理' if status == 'processed' else '处理异常'),
-                           'details': {'PR': number, '通道': entry.get('route'), '尝试次数': entry.get('attempts'),
-                                       '审查地址': entry.get('review_url'), '时间精度': '业务队列记录；不是调度器的完整执行历史'}})
-    last_scan = data.get('last_scan_at')
-    if last_scan and needs_receipt('pr-scan', last_scan):
-        result = scan_result_from_log(scan_log_tail(), data.get('scan_id'))
-        import_record({'task_id': 'pr-scan', 'external_key': f'scan:{data.get("scan_id")}', 'status': result[0] if result else 'success',
-                       'created_at': last_scan, 'finished_at': last_scan, 'summary': result[1] if result else f'扫描 #{data.get("scan_id")} · 已读取最新 PR 队列',
-                       'details': {'时间精度': '只有扫描记录时间，开始时间与耗时未知'}})
-    return {'last_scan_at': last_scan, 'scan_id': data.get('scan_id'), 'queue_counts': counts,
-            'queue_items': active, 'scheduling': data.get('scheduling', {})}
-
-
-def report_data():
-    latest = None
-    for path in sorted((PR_ROOT / 'daily-reports').glob('*/notification.json')):
-        receipt = read_json(path)
-        data = read_json(path.parent / 'data.json')
-        rows = data.get('rows', [])
-        sent = receipt.get('sent_at')
-        record_time = sent or data.get('generated_at')
-        if not record_time:
+    config = store.get_task_configs().get('pr-scan', {})
+    with store.connect() as db:
+        row = db.execute('SELECT snapshot FROM tasks WHERE id=?', ('pr-scan',)).fetchone()
+    task = json.loads(row['snapshot']) if row else {}
+    paths = config.get('log_paths', task.get('log_paths', []))
+    contents = []
+    for value in paths:
+        path = Path(value)
+        if not path.is_file():
             continue
-        reported = [row['total_tokens'] for row in rows if isinstance(row.get('total_tokens'), (int, float))]
-        info = {'date': path.parent.name, 'sent_at': sent, 'status': receipt.get('status'), 'pr_count': len(rows),
-                'total_tokens': sum(reported) if reported else None, 'partial_usage': any(row.get('partial_usage') for row in rows),
-                'rows': rows, 'path': str(path.parent)}
-        latest = info
-        if needs_receipt('pr-report', record_time):
-            status = {'sent': 'success', 'failed': 'failed'}.get(receipt.get('status'), 'unknown')
-            import_record({'task_id': 'pr-report', 'external_key': 'report:' + path.parent.name,
-                           'created_at': record_time, 'finished_at': sent, 'status': status,
-                           'summary': f'{path.parent.name} 日报 · {len(rows)} 个 PR · ' + ('已发送' if status == 'success' else '发送状态待确认'),
-                           'details': {'统计日期': path.parent.name, 'PR 数量': len(rows), '累计 Token': info['total_tokens'],
-                                       '部分用量缺失': info['partial_usage'], '时间精度': '发送凭据时间；开始时间与耗时未知'}})
-    return {'latest_report': latest}
+        with path.open('rb') as stream:
+            stream.seek(max(0, path.stat().st_size - 48000))
+            contents.append(stream.read(48000).decode('utf-8', errors='replace'))
+    return '\n'.join(contents)
 
 
-def metaso_data():
-    """持续接入现有 Codex 记忆记录；不调用 API、不执行脚本、不发送通知。"""
-    memory = METASO_ROOT / 'memory.md'
-    text = memory.read_text() if memory.exists() else ''
-    records = []
-    pattern = r'- 运行时间:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\n]*\n- 结果:\s*([^\n]+)'
-    for date, summary in re.findall(pattern, text):
-        observed = dt.datetime.strptime(date, '%Y-%m-%d %H:%M:%S').replace(tzinfo=ZONE).timestamp()
-        balance_match = re.search(r'余额\s*([\d,]+)\s*点', summary)
-        balance = int(balance_match[1].replace(',', '')) if balance_match else None
-        status = 'success' if re.search(r'退出码\s*0', summary) else 'failed' if re.search(r'失败|退出码\s*[1-9]', summary) else 'unknown'
-        info = {'observed_at': observed, 'balance': balance, 'summary': summary, 'status': status}
-        records.append(info)
-        import_record({'task_id': 'metaso-balance', 'external_key': 'metaso:' + date, 'status': status,
-                       'created_at': observed, 'finished_at': observed, 'summary': summary,
-                       'details': {'剩余积分': balance, '预警阈值': 1000, '时间精度': 'Codex 留存记录时间；开始时间与耗时未知'}})
-    return {'balance': records[-1]['balance'] if records else None, 'threshold': 1000, 'balance_history': records[-30:]}
+def normalize_empty_scans():
+    """将明确记录空队列的成功扫描归类为跳过，保留失败和未知结果。"""
+    key = 'empty_scan_classification_v1'
+    previous = store.get_meta(key)
+    since = time.time() - 86400 if previous and previous.get('history_normalized') else 0
+    with store.connect() as db:
+        rows = db.execute("SELECT id,kind,external_key,log_tail FROM runs WHERE task_id='pr-scan' AND status='success' AND ((kind='execution' AND exit_code=0) OR (kind='history' AND external_key LIKE 'scan:%')) AND created_at>=?", (since,)).fetchall()
+    updates, original_log = [], None
+    for row in rows:
+        if row['kind'] == 'history':
+            if original_log is None:
+                original_log = scan_log_tail()
+            result = scan_result_from_log(original_log, row['external_key'].removeprefix('scan:'))
+        else:
+            result = scan_result_from_log(row['log_tail'])
+        if result is not None and result[0] == 'skipped':
+            updates.append((row['id'], result[1]))
+    if updates:
+        store.backup_database('monitor-before-empty-scan-v1.sqlite3')
+        with store.connect() as db:
+            db.executemany("UPDATE runs SET status='skipped',summary=? WHERE id=? AND status='success' AND (exit_code=0 OR (kind='history' AND external_key LIKE 'scan:%'))", [(summary, run_id) for run_id, summary in updates])
+    if updates or previous is None or not previous.get('history_normalized'):
+        store.set_meta(key, {'applied_at': (previous or {}).get('applied_at', time.time()),
+                             'reclassified': (previous or {}).get('reclassified', 0) + len(updates), 'history_normalized': True})
+    return len(updates)
 
 
 def automation_calendar(rule):
-    """把现有每日/每周 Codex 规则转换为展示用日历；不认识的形式保持未知。"""
+    """将简单的每日/每周规则转换成 launchd 日历规则；复杂规则保持未知。"""
     values = dict(part.split('=', 1) for part in rule.removeprefix('RRULE:').split(';') if '=' in part)
     if set(values) - {'FREQ', 'INTERVAL', 'BYDAY', 'BYHOUR', 'BYMINUTE'} or values.get('INTERVAL', '1') != '1':
         return None
@@ -211,20 +181,16 @@ def schedule_info(task, definition, now):
     interval = definition.get('StartInterval')
     calendar = definition.get('StartCalendarInterval')
     if interval:
-        task['schedule'] = {'type': 'interval', 'seconds': interval, 'text': f'每 {interval // 60} 分钟' if interval % 60 == 0 else f'每 {interval} 秒'}
-        if task['id'] == 'pr-worker':
-            task['schedule']['text'] += '兜底，入队时唤起'
-        reference = (task.get('last_run') or {}).get('started_at') or (task.get('data') or {}).get('last_scan_at')
+        task['schedule'] = {'type': 'interval', 'seconds': interval,
+                            'text': f'每 {interval // 60} 分钟' if interval % 60 == 0 else f'每 {interval} 秒'}
+        reference = (task.get('last_run') or {}).get('started_at')
         task['next_at'] = reference + (int((now - reference) // interval) + 1) * interval if reference and not task.get('pid') else None
         task['next_estimated'] = True
     elif calendar:
         calendars = calendar if isinstance(calendar, list) else [calendar]
-        candidates = []
-        previous = []
-        labels = []
+        candidates, previous, labels = [], [], []
         for rule in calendars:
             local = dt.datetime.fromtimestamp(now, ZONE)
-            # 只计算能明确解释的规则，复杂月历不伪造下一执行时间。
             if set(rule) == {'Minute'} and 0 <= rule['Minute'] <= 59:
                 next_date = local.replace(minute=rule['Minute'], second=0, microsecond=0)
                 if next_date.timestamp() <= now:
@@ -245,158 +211,144 @@ def schedule_info(task, definition, now):
                 prefix = f'每周{"日一二三四五六"[weekday % 7]}' if weekday is not None else '每天'
                 labels.append(f'{prefix} {rule["Hour"]:02d}:{rule.get("Minute", 0):02d}')
         task['schedule'] = {'type': 'calendar', 'rules': calendars,
-                            'text': '、'.join(labels) if candidates and len(candidates) == len(calendars) else '日历规则：' + json.dumps(calendar, ensure_ascii=False)}
+                            'text': '、'.join(labels) if candidates and len(candidates) == len(calendars)
+                            else '日历规则：' + str(calendar)}
         task['next_at'] = min(candidates) if candidates else None
         task['previous_at'] = max(previous) if previous else None
         task['next_estimated'] = False
     else:
-        task['schedule'] = {'type': 'unknown', 'text': '未识别执行规则'}
+        task['schedule'] = {'type': 'manual', 'text': '手动或事件触发'}
         task['next_at'] = None
     return task
 
 
 def recover_orphans():
-    """仅当记录进程已不存在时结算为中断；空闲执行器的旧业务心跳不用于故障判断。"""
+    """进程消失时标记中断，但不把观察时间误记成实际结束时间。"""
     with store.connect() as db:
-        rows = db.execute("SELECT id,pid,process_start,started_at FROM runs WHERE status='running'").fetchall()
+        rows = db.execute('SELECT id,pid,process_start,started_at FROM runs WHERE status=?', ('running',)).fetchall()
     for row in rows:
-        if time.time() - row['started_at'] < 30:
+        if row['started_at'] is not None and time.time() - row['started_at'] < 30:
             continue
         result = command(['ps', '-p', str(row['pid']), '-o', 'lstart='])
         if result.returncode or (row['process_start'] and result.stdout.strip() != row['process_start']):
             store.update_run(row['id'], status='interrupted', summary='记录进程已退出，未收到正常结束凭据；实际结束时间未知')
 
 
-def normalize_empty_scans():
-    """修正有明确空队列日志的成功扫描，保留失败/中断/未知记录；兼容部署前已启动的入口。"""
-    key = 'empty_scan_classification_v1'
-    previous = store.get_meta(key)
-    # 首次修正全部历史；后续只检查一天内的旧入口结果，不反复扫描全量账本。
-    since = time.time() - 86400 if previous and previous.get('history_normalized') else 0
-    with store.connect() as db:
-        rows = db.execute("SELECT id,kind,external_key,log_tail FROM runs WHERE task_id='pr-scan' AND status='success' AND ((kind='execution' AND exit_code=0) OR (kind='history' AND external_key LIKE 'scan:%')) AND created_at>=?", (since,)).fetchall()
-    updates = []
-    original_log = None
-    for row in rows:
-        if row['kind'] == 'history':
-            if original_log is None:
-                original_log = scan_log_tail()
-            result = scan_result_from_log(original_log, row['external_key'].removeprefix('scan:'))
-        else:
-            result = scan_result_from_log(row['log_tail'])
-        if result is not None and result[0] == 'skipped':
-            updates.append((row['id'], result[1]))
-    if updates:
-        store.backup_database('monitor-before-empty-scan-v1.sqlite3')
-        with store.connect() as db:
-            # 条件重检，防止旧进程或另一采集轮次已经改变同一记录的结果。
-            db.executemany("UPDATE runs SET status='skipped',summary=? WHERE id=? AND status='success' AND (exit_code=0 OR (kind='history' AND external_key LIKE 'scan:%'))", [(summary, run_id) for run_id, summary in updates])
-    if updates or previous is None or not previous.get('history_normalized'):
-        store.set_meta(key, {'applied_at': (previous or {}).get('applied_at', time.time()),
-                             'reclassified': (previous or {}).get('reclassified', 0) + len(updates), 'history_normalized': True})
-    return len(updates)
-
-
 def collect():
-    """每轮保存完整快照和采集错误；单一业务文件损坏不会停止其他任务的监控。"""
+    """更新自动发现任务与服务的状态快照；不访问任务业务数据或调用任务。"""
     now = time.time()
-    normalize_empty_scans()
     errors = []
+    normalize_empty_scans()
+    detected, services = read_definitions()
+    configurations = store.get_task_configs()
+    ai_scripts = store.get_ai_scripts()
+    tasks = []
+    for task in detected:
+        settings = configurations.get(task['id'], {})
+        task['name'] = settings.get('name') or task['name']
+        task['description'] = settings.get('description', task['description'])
+        task['log_paths'] = list(task.get('log_paths', []))
+        ai_script = ai_scripts.get(settings.get('ai_script_id'), {})
+        ai_output = ai_script.get('output_path')
+        if ai_output and ai_output not in task['log_paths']:
+            task['log_paths'].append(ai_output)
+        tasks.append(task)
+    for task_id, settings in configurations.items():
+        if settings.get('source') != 'external' or settings.get('enabled') is False:
+            continue
+        tasks.append({'id': task_id, 'label': None, 'name': settings['name'],
+                      'description': settings.get('description', ''), 'source': 'external',
+                      'category': 'work', 'icon': 'clock', 'script': settings.get('script', ''),
+                      'log_paths': settings.get('log_paths', []), 'external_schedule': settings.get('schedule', '')})
     try:
         states = gui_states()
         launchd_available = True
     except Exception as error:
         states, launchd_available = {}, False
-        errors.append(str(error))
-    sources = {}
-    for key, reader in [('backup', backup_data), ('pr', pr_data),
-                        ('report', report_data), ('metaso', metaso_data)]:
-        try:
-            sources[key] = reader()
-        except Exception as error:
-            sources[key] = {'source_error': redact(str(error))}
-            errors.append(f'{key}: {redact(error)}')
+        errors.append(redact(error))
 
-    for task in definitions():
+    seen = []
+    for task in tasks:
+        label = task['label']
+        if task['source'] == 'external':
+            with store.connect() as db:
+                row = db.execute('SELECT * FROM runs WHERE task_id=? ORDER BY created_at DESC LIMIT 1', (task['id'],)).fetchone()
+            task['last_run'] = store.decode_run(row)
+            if task['last_run']:
+                task['last_run'].pop('log_tail', None)
+            task['loaded'] = True
+            task['pid'] = None
+            task['last_exit_code'] = None
+            task['instrumented'] = False
+            task['state'] = 'unknown'
+            task['schedule'] = {'type': 'external', 'text': task.pop('external_schedule') or '外部调度'}
+            task['next_at'] = None
+            task['next_estimated'] = False
+            task['updated_at'] = now
+            store.save_task(task)
+            seen.append(task['id'])
+            continue
         definition = {}
-        if task.get('label'):
-            try:
-                definition = plistlib.loads((AGENTS / (task['label'] + '.plist')).read_bytes())
-            except Exception as error:
-                errors.append(task['id'] + ': ' + redact(error))
-            task.update(states.get(task['label'], {'loaded': False, 'pid': None, 'last_exit_code': None}))
-        else:
-            try:
-                automation = tomllib.loads((METASO_ROOT / 'automation.toml').read_text())
-                task.update({'loaded': automation.get('status') == 'ACTIVE', 'pid': None, 'last_exit_code': None})
-                definition = {'StartCalendarInterval': automation_calendar(automation.get('rrule', ''))}
-            except Exception as error:
-                task.update({'loaded': False, 'pid': None, 'last_exit_code': None})
-                sources['metaso']['source_error'] = '调度配置无法读取：' + redact(error)
-                errors.append(sources['metaso']['source_error'])
-        task['definition_path'] = str(AGENTS / (task['label'] + '.plist')) if task.get('label') else str(METASO_ROOT / 'automation.toml')
+        try:
+            definition = plistlib.loads(Path(task['definition_path']).read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException) as error:
+            errors.append(label + ': ' + redact(error))
+        task.update(states.get(label, {'loaded': False, 'pid': None, 'last_exit_code': None}))
         task['instrumented'] = str(ROOT / 'runner.py') in definition.get('ProgramArguments', [])
-        task['run_at_load'] = bool(definition.get('RunAtLoad'))
-        task['log_paths'] = task.get('log_paths', [str(Path(task.get('log_root', '.')) / name) for name in task.get('logs', [])])
-        task.pop('log_root', None)
-        task.pop('logs', None)
-        source_key = {'fastgpt-backup': 'backup', 'pr-scan': 'pr', 'pr-worker': 'pr', 'pr-report': 'report', 'metaso-balance': 'metaso'}.get(task['id'])
-        task['data'] = sources.get(source_key, {})
         with store.connect() as db:
-            row = db.execute('SELECT * FROM runs WHERE task_id=? ORDER BY created_at DESC LIMIT 1', (task['id'],)).fetchone()
+            row = db.execute('SELECT * FROM runs WHERE task_id=? ORDER BY created_at DESC LIMIT 1', (label,)).fetchone()
         task['last_run'] = store.decode_run(row)
         if task['last_run']:
             task['last_run'].pop('log_tail', None)
         last = task['last_run'] or {}
         task['state'] = 'running' if task['pid'] or last.get('status') == 'running' else 'ready'
-        if not launchd_available and task.get('label'):
+        if not launchd_available:
             task['state'] = 'unknown'
         elif not task['loaded']:
             task['state'] = 'disabled'
         elif task['state'] != 'running':
-            if last.get('status') in ('failed', 'interrupted', 'unknown'):
+            if last.get('status') in ('failed', 'interrupted', 'unknown') or task.get('last_exit_code') not in (None, 0):
                 task['state'] = 'attention'
-            elif task.get('last_exit_code') not in (None, 0):
-                task['state'] = 'attention'
-        if task['data'].get('source_error'):
-            task['state'] = 'unknown'
         schedule_info(task, definition, now)
         if not task['loaded']:
             task['next_at'] = None
-        # 错过每日任务超过 30 分钟才提示；原始记录缺失与任务执行失败分别展示。
         if task['schedule']['type'] == 'calendar' and task.get('next_at') and task['state'] == 'ready':
             previous = task.get('previous_at')
             if previous is not None and now > previous + 1800 and last.get('created_at', 0) < previous:
                 task['state'] = 'overdue'
         if task['instrumented'] and task['schedule']['type'] == 'interval' and task['state'] == 'ready':
-            installation = store.get_meta('installation:' + task['id'], {})
-            # 未产生新记录不等于执行失败，因此使用“记录逾期”；给调度抖动保留两个周期。
+            installation = store.get_meta('installation:' + label, {})
             reference = max(installation.get('installed_at', 0), last.get('finished_at') or last.get('created_at', 0))
             if reference and now - reference > task['schedule']['seconds'] * 2 + 60:
                 task['state'] = 'overdue'
         task['updated_at'] = now
         store.save_task(task)
+        seen.append(label)
 
-    services = []
-    for service in copy.deepcopy(SERVICES):
-        try:
-            if service['domain'] == 'gui':
-                service.update(states.get(service['label'], {'loaded': False, 'pid': None, 'last_exit_code': None}))
-            else:
-                result = command(['launchctl', 'print', 'system/' + service['label']])
-                pid = re.search(r'^\tpid = (\d+)$', result.stdout, re.M)
-                code = re.search(r'^\tlast exit code = (-?\d+)$', result.stdout, re.M)
-                service.update({'loaded': result.returncode == 0, 'pid': int(pid[1]) if pid else None, 'last_exit_code': int(code[1]) if code else None})
-            service['state'] = 'running' if service['pid'] else 'attention' if service.get('last_exit_code') not in (None, 0) else 'stopped'
-        except Exception:
-            service['state'] = 'unknown'
-        services.append(service)
-    store.set_meta('collector', {'checked_at': now, 'errors': errors, 'hostname': socket.gethostname(), 'services': services})
+    with store.connect() as db:
+        if seen:
+            placeholders = ','.join('?' for _ in seen)
+            db.execute('DELETE FROM tasks WHERE id NOT IN (' + placeholders + ')', seen)
+        else:
+            db.execute('DELETE FROM tasks')
+
+    service_snapshots = []
+    for service in services:
+        settings = configurations.get(service['id'], {})
+        service['name'] = settings.get('name') or service['name']
+        service['description'] = settings.get('description', service['description'])
+        service['log_paths'] = service.get('log_paths', [])
+        service.update(states.get(service['label'], {'loaded': False, 'pid': None, 'last_exit_code': None}))
+        service['state'] = ('unknown' if not launchd_available else 'disabled' if not service['loaded'] else 'running' if service['pid']
+                            else 'attention' if service.get('last_exit_code') not in (None, 0) else 'stopped')
+        service_snapshots.append(service)
+    store.set_meta('collector', {'checked_at': now, 'errors': errors, 'hostname': socket.gethostname(),
+                                'services': service_snapshots})
     recover_orphans()
 
 
 def loop(stop):
-    """采集线程的异常只记入自身日志；后台持续重试，网页仍可读取上次成功快照。"""
+    """持续更新状态，采集失败时保留上一轮快照并稍后重试。"""
     while not stop.is_set():
         try:
             collect()

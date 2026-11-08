@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""AI/命令行安装入口：备份 launchd 定义，空闲时接入记录层，并启动网页。"""
+"""安装本地看板 LaunchAgent；launchd 任务由 taskctl.py 管理。"""
 
 import argparse
-import hashlib
-import json
 import os
 import plistlib
 import subprocess
@@ -12,9 +10,10 @@ import time
 from pathlib import Path
 
 import store
-from config import AGENTS, DATA, ROOT, TASKS
+import collector
+from config import AGENTS, DATA, ROOT
 
-PYTHON = '/opt/homebrew/bin/python3'
+PYTHON = sys.executable
 MONITOR_LABEL = 'com.yjl.macmini-task-monitor'
 
 
@@ -45,51 +44,6 @@ def bootstrap(path):
         time.sleep(1)
 
 
-def wrap_tasks():
-    """仅包装四个已授权业务任务；运行中的任务等待结束，不终止已有审查。"""
-    folder = DATA / 'launchd-backups'
-    folder.mkdir(mode=0o700, exist_ok=True)
-    domain = f'gui/{os.getuid()}'
-    for task in TASKS:
-        if task['source'] != 'launchd':
-            continue
-        path = AGENTS / (task['label'] + '.plist')
-        original = path.read_bytes()
-        definition = plistlib.loads(original)
-        if str(ROOT / 'runner.py') in definition.get('ProgramArguments', []):
-            print(task['id'] + ': already instrumented', flush=True)
-            continue
-        while True:
-            state = launchctl(['list', task['label']], check=False)
-            if '"PID"' not in state.stdout:
-                break
-            print(task['id'] + ': waiting for current execution to finish', flush=True)
-            time.sleep(5)
-        digest = hashlib.sha256(original).hexdigest()[:16]
-        backup = folder / (task['label'] + '.' + digest + '.plist')
-        if not backup.exists():
-            backup.write_bytes(original)
-            os.chmod(backup, 0o600)
-        args = definition.get('ProgramArguments')
-        if not args:
-            raise RuntimeError('缺少原始 ProgramArguments：' + task['label'])
-        definition['ProgramArguments'] = [PYTHON, str(ROOT / 'runner.py'), '--task-id', task['id'], '--', *args]
-        was_loaded = state.returncode == 0
-        atomic_write(path, plistlib.dumps(definition, sort_keys=False))
-        try:
-            if was_loaded:
-                launchctl(['bootout', domain + '/' + task['label']])
-                bootstrap(path)
-        except Exception:
-            # 调度器重载失败时立即恢复原入口，保持业务可运行。
-            atomic_write(path, original)
-            if was_loaded:
-                bootstrap(path)
-            raise
-        store.set_meta('installation:' + task['id'], {'installed_at': time.time(), 'original': str(backup)})
-        print(task['id'] + ': instrumented; original saved', flush=True)
-
-
 def install_service(options):
     """监控进程常驻；网页服务的重启不影响独立运行的业务记录入口。"""
     args = [PYTHON, str(ROOT / 'server.py'), '--port', str(options.port)]
@@ -101,7 +55,8 @@ def install_service(options):
     definition = {'Label': MONITOR_LABEL, 'ProgramArguments': args, 'WorkingDirectory': str(ROOT),
                   'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10,
                   'StandardOutPath': str(DATA / 'server.log'), 'StandardErrorPath': str(DATA / 'server.stderr.log'),
-                  'EnvironmentVariables': {'TZ': 'Asia/Shanghai', 'PYTHONUNBUFFERED': '1', 'PATH': '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'}}
+                  'EnvironmentVariables': {'TZ': 'Asia/Shanghai', 'PYTHONUNBUFFERED': '1',
+                                           'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')}}
     atomic_write(path, plistlib.dumps(definition, sort_keys=False))
     domain = f'gui/{os.getuid()}'
     launchctl(['bootout', domain + '/' + MONITOR_LABEL], check=False)
@@ -113,7 +68,7 @@ def install_service(options):
 def restore_tasks():
     """只恢复仍使用本记录入口的 plist，避免覆盖后来由用户或 AI 修改的任务。"""
     domain = f'gui/{os.getuid()}'
-    for task in TASKS:
+    for task in collector.definitions():
         receipt = store.get_meta('installation:' + task['id'])
         if not receipt:
             continue
@@ -142,5 +97,4 @@ if __name__ == '__main__':
     if options.restore_tasks:
         restore_tasks()
     else:
-        wrap_tasks()
         install_service(options)

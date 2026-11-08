@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Mac mini 定时任务的只读监控：执行计划、运行记录、日志与任务详情。" />
+    <meta name="description" content="Mac mini 定时任务监控：执行计划、运行记录、日志与 AI 脚本管理。" />
     <title>Mac mini · 任务监控</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="stylesheet" href="/styles.css" />
@@ -17,10 +17,12 @@
         <a href="#overview" data-nav="overview"><span data-icon="grid"></span>任务总览</a>
         <a href="#history" data-nav="history"><span data-icon="history"></span>执行记录<span id="history-count" class="nav-count"></span></a>
         <a href="#services" data-nav="services"><span data-icon="server"></span>后台服务</a>
+        <a href="#configuration" data-nav="configuration"><span data-icon="clock"></span>本机任务</a>
+        <a href="#ai-scripts" data-nav="ai-scripts"><span data-icon="workflow"></span>AI 脚本</a>
       </nav>
       <div class="sidebar-bottom">
         <div class="host-card"><span class="host-icon" data-icon="server"></span><div><strong>Mac mini</strong><small id="host-name">正在连接主机</small></div><span class="live-dot"></span></div>
-        <div class="readonly"><span data-icon="lock"></span>只读观察 · Asia/Shanghai</div>
+        <div class="readonly"><span data-icon="settings"></span>任务可管理 · AI 脚本可配置</div>
       </div>
     </aside>
     <div class="workspace">
@@ -29,6 +31,7 @@
       <footer><span>MINI MONITOR <span class="footer-dot">·</span> 本机 SQLite 记录</span><span id="footer-info">每 15 秒自动同步</span></footer>
     </div>
     <dialog id="run-dialog" aria-labelledby="dialog-title"><div id="dialog-content"></div></dialog>
+    <dialog id="config-dialog" aria-labelledby="config-title"><div id="config-content"></div></dialog>
     <div id="toast" role="status" hidden></div>
   </body>
 </html>

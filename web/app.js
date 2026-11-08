@@ -18,7 +18,8 @@ const paths = {
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>',
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M7 3v4M17 3v4M8 14h2M14 14h2M8 17h2"/>',
   pulse: '<path d="M2 12h5l3-8 4 16 3-8h5"/>',
-  alert: '<path d="m10.3 3.8-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3.2l-8-14a2 2 0 0 0-3.4 0ZM12 9v4M12 17h.01"/>'
+  alert: '<path d="m10.3 3.8-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3.2l-8-14a2 2 0 0 0-3.4 0ZM12 9v4M12 17h.01"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.6a8 8 0 0 1-1.6.9l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.6-.9l-1.7.6-1.4-2.4 1.4-1.1a7 7 0 0 1 0-1.9l-1.4-1.1 1.4-2.4 1.7.6a8 8 0 0 1 1.6-.9l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.6.9l1.7-.6 1.4 2.4-1.4 1.1a7 7 0 0 1 0 1.8Z"/>'
 };
 const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] ?? paths.clock}</svg>`;
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -35,14 +36,16 @@ const duration = (value) => value === null || value === undefined ? '未知' : v
 const sourceLabel = (run) => run.kind === 'history' ? '历史凭据' : '实时采集';
 const taskName = (id) => state.data?.tasks.find((task) => task.id === id)?.name ?? id;
 const taskHref = (id) => `#task/${encodeURIComponent(id)}`;
-const state = { data: null, route: '', taskSearch: '', filters: { task_id: '', status: 'non_skipped', kind: '', days: '7', search: '' }, offset: 0, history: null, historyTicket: 0, logs: new Map(), shownLogs: new Set(), loading: false, dialogRun: null };
+const state = { data: null, route: '', taskSearch: '', filters: { task_id: '', status: 'non_skipped', kind: '', days: '7', search: '' }, offset: 0, history: null, historyTicket: 0, logs: new Map(), shownLogs: new Set(), loading: false, dialogRun: null, configItems: null, aiScripts: [], aiProviders: [], configLoading: false, configError: '' };
 const main = document.querySelector('#main');
 const dialog = document.querySelector('#run-dialog');
+const configDialog = document.querySelector('#config-dialog');
 let searchTimer;
+let configurationRequest = null;
 
-/** 所有数据显示都转义后插入；接口不提供执行、暂停或修改任务的动作。 */
-async function api(path) {
-  const response = await fetch(path, { cache: 'no-store', signal: AbortSignal.timeout(12000) });
+/** 显示内容转义；launchd 配置保存会应用到真实调度器。 */
+async function api(path, options = {}) {
+  const response = await fetch(path, { cache: 'no-store', signal: AbortSignal.timeout(12000), ...options });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error ?? `请求失败 (${response.status})`);
   return data;
@@ -67,7 +70,8 @@ function heading(title, subtitle, eyebrow = 'MAC MINI / OPERATIONS') {
 function taskRows(tasks) {
   return tasks.map((task) => {
     const last = task.last_run;
-    return `<tr class="clickable" data-task="${esc(task.id)}"><td><div class="task-name"><span class="task-icon">${icon(task.icon)}</span><a class="task-link" href="${taskHref(task.id)}"><strong>${esc(task.name)}</strong><small>${task.source === 'codex-script' ? 'Codex 触发 · 脚本执行' : 'launchd · ' + (task.instrumented ? '已接入完整记录' : '现有状态')}</small></a></div></td><td>${badge(task.state)}</td><td><span class="schedule-text">${esc(task.schedule.text)}</span><span class="secondary">北京时间${task.run_at_load ? ' · 登录时也执行' : ''}</span></td><td class="time">${last ? dateTime(last.created_at) : '暂无记录'}<span class="secondary">${last ? (last.status === 'running' ? '执行中' : labels[last.status]) + ' · ' + sourceLabel(last) : '等待首次采集'}</span></td><td class="time">${task.next_at ? dateTime(task.next_at) : task.state === 'running' ? '当前正在执行' : '由调度器决定'}<span class="secondary">${task.next_at ? task.next_estimated ? '间隔估计' : '计划时间' : ''}</span></td><td class="arrow">${icon('arrow')}</td></tr>`;
+    const origin = task.source === 'external' ? '旧版外部登记' : task.instrumented ? 'launchd · 已接入执行记录' : 'launchd · 自动发现';
+    return `<tr class="clickable" data-task="${esc(task.id)}"><td><div class="task-name"><span class="task-icon">${icon(task.icon)}</span><a class="task-link" href="${taskHref(task.id)}"><strong>${esc(task.name)}</strong><small>${origin}</small></a></div></td><td>${badge(task.state)}</td><td><span class="schedule-text">${esc(task.schedule.text)}</span><span class="secondary">北京时间</span></td><td class="time">${last ? dateTime(last.created_at) : '暂无记录'}<span class="secondary">${last ? (last.status === 'running' ? '执行中' : labels[last.status]) + ' · ' + sourceLabel(last) : '等待首次采集'}</span></td><td class="time">${task.next_at ? dateTime(task.next_at) : task.state === 'running' ? '当前正在执行' : '由调度器决定'}<span class="secondary">${task.next_at ? task.next_estimated ? '间隔估计' : '计划时间' : ''}</span></td><td class="arrow">${icon('arrow')}</td></tr>`;
   }).join('');
 }
 
@@ -99,7 +103,7 @@ function overview() {
   const filtered = tasks.filter((task) => (task.name + task.description).toLowerCase().includes(state.taskSearch.toLowerCase()));
   return `${heading('任务总览', '掌握每一次运行，让定时任务有迹可循。')}
     ${data.collector.errors?.length ? `<div class="notice">部分数据源暂时无法读取：${esc(data.collector.errors.join('；'))}。页面保留已采集记录。</div>` : ''}
-    <section class="stats" aria-label="任务概况"><div class="stat"><div class="stat-label">监控任务${icon('grid')}</div><div class="stat-value">${stats.tasks}<small>个任务</small></div><div class="stat-note">${tasks.filter((task) => task.instrumented).length} 个完整记录 · ${tasks.filter((task) => task.source === 'codex-script').length} 个外部触发</div></div><div class="stat"><div class="stat-label">今日记录${icon('history')}</div><div class="stat-value">${number(stats.today)}<small>条</small></div><div class="stat-note">${stats.counts.success ?? 0} 次成功 · ${stats.counts.skipped ?? 0} 次跳过</div></div><div class="stat"><div class="stat-label">正在运行${icon('pulse')}</div><div class="stat-value healthy">${stats.running}<small>个任务</small></div><div class="stat-note">${stats.running ? '任务正在执行中' : '当前等待下一次调度'}</div></div><div class="stat"><div class="stat-label">需要关注${icon('alert')}</div><div class="stat-value ${stats.attention ? 'problem' : 'healthy'}">${stats.attention}<small>个任务</small></div><div class="stat-note">${stats.attention ? '查看异常、逾期或缺失记录' : '任务状态正常'}</div></div></section>
+    <section class="stats" aria-label="任务概况"><div class="stat"><div class="stat-label">监控任务${icon('grid')}</div><div class="stat-value">${stats.tasks}<small>个任务</small></div><div class="stat-note">${tasks.filter((task) => task.instrumented).length} 个完整记录 · ${tasks.filter((task) => task.source === 'external').length} 个页面登记</div></div><div class="stat"><div class="stat-label">今日记录${icon('history')}</div><div class="stat-value">${number(stats.today)}<small>条</small></div><div class="stat-note">${stats.counts.success ?? 0} 次成功 · ${stats.counts.skipped ?? 0} 次跳过</div></div><div class="stat"><div class="stat-label">正在运行${icon('pulse')}</div><div class="stat-value healthy">${stats.running}<small>个任务</small></div><div class="stat-note">${stats.running ? '任务正在执行中' : '当前等待下一次调度'}</div></div><div class="stat"><div class="stat-label">需要关注${icon('alert')}</div><div class="stat-value ${stats.attention ? 'problem' : 'healthy'}">${stats.attention}<small>个任务</small></div><div class="stat-note">${stats.attention ? '查看异常、逾期或缺失记录' : '任务状态正常'}</div></div></section>
     <section class="panel"><div class="panel-heading"><div><h2>定时任务<span class="count-pill">${tasks.length}</span></h2><p class="panel-description">执行计划、运行状态与最近结果</p></div><label class="search-box">${icon('search')}<input id="task-search" type="search" aria-label="搜索任务" placeholder="搜索任务…" value="${esc(state.taskSearch)}" /></label></div>${taskTable(filtered)}<div class="panel-foot">${icon('info')}点击任务查看详情。间隔任务的下次时间为估计；历史记录保留原有精度。</div></section>
     <div class="lower-grid"><section class="panel"><div class="panel-heading"><div><h2>最近活动</h2><p class="panel-description">最新的执行与结果记录</p></div><a href="#history" class="text-link">全部记录${icon('arrow')}</a></div><div class="activity">${activityRows(data.recent)}</div></section><section class="panel"><div class="panel-heading"><div><h2>运行记录趋势</h2><p class="panel-description">最近 7 天</p></div><span class="count-pill">7 DAYS</span></div>${chart()}</section></div>`;
 }
@@ -142,30 +146,6 @@ function infoRow(label, content, mono = false) {
   return `<div class="info-row"><dt>${esc(label)}</dt><dd${mono ? ' class="mono"' : ''}>${content}</dd></div>`;
 }
 
-function business(task) {
-  const data = task.data;
-  if (task.id === 'metaso-balance') {
-    const history = data.balance_history ?? [];
-    const values = history.filter((item) => item.balance !== null).map((item) => item.balance);
-    const min = Math.min(...values), max = Math.max(...values);
-    const points = values.map((value, index) => `${index / Math.max(1, values.length - 1) * 400},${43 - (value - min) / Math.max(1, max - min) * 38}`).join(' ');
-    return `<div class="panel"><div class="panel-heading"><h2>账户积分</h2>${data.balance !== null && data.balance < data.threshold ? badge('attention') : badge('success')}</div><div class="business-card"><div class="business-label">最近留存的剩余积分</div><div class="business-value">${number(data.balance)}<small>点</small></div><div class="secondary">${history.length ? fullTime(history.at(-1).observed_at) : '暂无记录'} · 非实时余额查询</div>${values.length > 1 ? `<svg class="sparkline" viewBox="0 0 400 48" preserveAspectRatio="none" role="img" aria-label="最近 ${values.length} 次余额记录趋势"><polyline points="${points}" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>` : ''}<div class="mini-stats"><div class="mini-stat">告警阈值<strong>${number(data.threshold)}</strong></div><div class="mini-stat">调度方式<strong style="font-size:14px">Codex 定时触发</strong></div></div></div></div>`;
-  }
-  if (task.id === 'fastgpt-backup') {
-    const backup = data.latest_backup;
-    return `<div class="panel"><div class="panel-heading"><h2>备份产物</h2>${backup ? badge('success') : badge('unknown')}</div><div class="business-card"><div class="business-label">最近一次备份大小</div><div class="business-value">${backup ? bytes(backup.bytes) : '—'}</div><div class="secondary">${backup ? `${fullTime(backup.completed_at)} · ${number(backup.file_count)} 个文件` : '尚无备份清单'}</div><div class="mini-stats"><div class="mini-stat">保留周期<strong>7 天</strong></div><div class="mini-stat">存储组件<strong>3 个</strong></div></div>${(data.backups ?? []).slice(-4).reverse().map((item) => `<div class="backup-item"><span>${esc(item.date)}</span><span>${bytes(item.bytes)} · ${item.file_count} 文件</span></div>`).join('')}</div></div>`;
-  }
-  if (task.id === 'pr-report') {
-    const report = data.latest_report;
-    return `<div class="panel"><div class="panel-heading"><h2>最近日报</h2>${report?.status === 'sent' ? badge('success') : badge('unknown')}</div><div class="business-card"><div class="business-label">${report ? esc(report.date) + ' 审查活动' : '暂无日报'}</div><div class="business-value">${number(report?.pr_count)}<small>个 PR</small></div><div class="secondary">发送时间 ${fullTime(report?.sent_at)}</div><div class="mini-stats"><div class="mini-stat">表内累计 Token<strong>${tokens(report?.total_tokens)}</strong></div><div class="mini-stat">用量覆盖<strong style="font-size:14px">${report?.partial_usage ? '部分缺失' : report ? '已有记录' : '未知'}</strong></div></div></div>${report ? `<div class="report-list"><table><tbody>${report.rows.map((row) => `<tr><td><a href="https://github.com/labring/FastGPT/pull/${encodeURIComponent(row.pr)}" target="_blank" rel="noreferrer">#${esc(row.pr)}</a></td><td title="${esc(row.title)}">${esc(row.title?.slice(0, 48))}</td><td>${tokens(row.total_tokens)}</td></tr>`).join('')}</tbody></table></div>` : ''}</div>`;
-  }
-  if (task.id === 'pr-scan' || task.id === 'pr-worker') {
-    const counts = data.queue_counts ?? {};
-    return `<div class="panel"><div class="panel-heading"><h2>PR 队列快照</h2><span class="count-pill">#${data.scan_id ?? '—'}</span></div><div class="business-card"><div class="business-label">最新扫描 ${fullTime(data.last_scan_at)}</div><div class="mini-stats" style="border:0;margin-top:0;padding-top:5px"><div class="mini-stat">已处理<strong>${counts.processed ?? 0}</strong></div><div class="mini-stat">待执行 / 执行中<strong>${(counts.queued ?? 0) + (counts.running ?? 0)}</strong></div><div class="mini-stat">处理异常<strong>${counts.error ?? 0}</strong></div></div><div class="mini-stats"><div class="mini-stat">最大并发<strong>${data.scheduling?.max_concurrent ?? 2}</strong></div><div class="mini-stat">静置窗口<strong>10 分钟</strong></div><div class="mini-stat">检查新提交<strong>15 秒</strong></div></div>${data.queue_items?.length ? data.queue_items.map((item) => `<div class="backup-item"><span>PR #${esc(item.pr)}</span><span>${esc(({ queued: '队列等待', running: '执行中', error: '异常' })[item.status] ?? item.status)}</span></div>`).join('') : '<div class="secondary" style="margin-top:20px">当前没有待处理或执行中的 PR。</div>'}</div></div>`;
-  }
-  return `<div class="panel"><div class="panel-heading"><h2>记录范围</h2></div><div class="business-card notes">自动发现的系统定时任务。展示 launchd 当前状态，尚未接入逐次执行记录。</div></div>`;
-}
-
 function renderLogs(taskId) {
   const result = state.logs.get(taskId);
   if (!result) return empty('正在读取日志…');
@@ -184,13 +164,229 @@ async function loadLogs(taskId) {
 }
 
 function detail(task) {
-  return `<a href="#overview" class="back-link">${icon('back')}返回任务总览</a><div class="page-heading"><div><div class="detail-heading"><span class="task-icon">${icon(task.icon)}</span><div><div class="eyebrow">TASK DETAILS</div><h1>${esc(task.name)}</h1></div>${badge(task.state)}</div><p class="subtitle detail-description">${esc(task.description)}</p></div></div><div class="detail-grid"><section class="panel"><div class="panel-heading"><h2>任务信息</h2><span class="count-pill">只读</span></div><dl class="info-list">${infoRow('调度来源', task.source === 'codex-script' ? 'Codex 定时触发本地脚本' : 'macOS launchd')}${infoRow('执行计划', esc(task.schedule.text) + ' · 北京时间')}${infoRow('下次执行', task.next_at ? fullTime(task.next_at) + (task.next_estimated ? '（估计）' : '（计划）') : '由调度器决定')}${infoRow('记录方式', task.instrumented ? '已接入执行入口 · 开始 / 结束 / 退出码 / 日志' : task.source === 'codex-script' ? '持续导入已有执行记录' : '读取现有状态')}${infoRow('入口脚本', esc(task.script), true)}${infoRow('调度配置', esc(task.definition_path), true)}${infoRow('launchd 状态', task.source === 'codex-script' ? '外部调度' : (task.loaded ? '已加载' : '未加载') + (task.pid ? ` · PID ${task.pid}` : ' · 当前无运行进程'))}${infoRow('最近退出码', esc(task.last_exit_code ?? '暂无调度器凭据'))}</dl></section><div>${business(task)}</div></div>${historyPanel(task.id)}<section class="panel"><div class="panel-heading"><div><h2>现有日志</h2><p class="panel-description">原脚本累计日志，可能包含已恢复的历史错误；每次执行的独立日志在上方记录中查看。</p></div><button class="button" data-logs="${esc(task.id)}">${icon('history')}${state.shownLogs.has(task.id) ? '刷新日志' : '查看日志'}</button></div><div class="logs-area" id="task-logs">${state.shownLogs.has(task.id) ? renderLogs(task.id) : '<p class="notes">按需读取现有日志，敏感凭据会隐藏。</p>'}</div></section>`;
+  const origin = task.source === 'external' ? '旧版外部登记' : '当前用户的 launchd';
+  return `<a href="#overview" class="back-link">${icon('back')}返回任务总览</a><div class="page-heading"><div><div class="detail-heading"><span class="task-icon">${icon(task.icon)}</span><div><div class="eyebrow">TASK DETAILS</div><h1>${esc(task.name)}</h1></div>${badge(task.state)}</div><p class="subtitle detail-description">${esc(task.description || '暂无说明')}</p></div></div><section class="panel"><div class="panel-heading"><h2>任务信息</h2><span class="count-pill">只读快照</span></div><dl class="info-list">${infoRow('任务来源', origin)}${infoRow('执行计划', esc(task.schedule.text) + ' · 北京时间')}${infoRow('下次执行', task.next_at ? fullTime(task.next_at) + (task.next_estimated ? '（估计）' : '（计划）') : '由调度器决定')}${infoRow('记录方式', task.instrumented ? '已接入执行入口 · 开始 / 结束 / 退出码 / 日志' : '当前状态自动采集')}${infoRow('入口脚本', esc(task.script || '未登记'), true)}${infoRow('最近退出码', esc(task.last_exit_code ?? '暂无调度器凭据'))}</dl></section>${historyPanel(task.id)}<section class="panel"><div class="panel-heading"><div><h2>现有日志</h2><p class="panel-description">按需读取已登记日志路径；敏感凭据会隐藏。</p></div><button class="button" data-logs="${esc(task.id)}">${icon('history')}${state.shownLogs.has(task.id) ? '刷新日志' : '查看日志'}</button></div><div class="logs-area" id="task-logs">${state.shownLogs.has(task.id) ? renderLogs(task.id) : '<p class="notes">点击“查看日志”后读取。</p>'}</div></section>`;
 }
 
 function services() {
   const items = state.data.collector.services ?? [];
   const tasks = state.data.tasks.filter((task) => task.category === 'system');
-  return `${heading('后台服务', '观察常驻服务的运行情况，与业务定时任务分开展示。')}<div class="service-grid">${items.map((service) => `<section class="service-card"><div class="service-top"><h2>${esc(service.name)}</h2>${badge(service.state)}</div><p>${esc(service.description)}</p><div class="service-meta"><span>PID<strong>${service.pid ?? '—'}</strong></span><span>最近退出码<strong>${service.last_exit_code ?? '—'}</strong></span><span>加载<strong>${service.loaded ? '是' : '否'}</strong></span></div><div class="secondary mono" style="margin-top:14px">${esc(service.label)}</div></section>`).join('')}</div>${tasks.length ? `<h2 class="system-heading">其他系统定时任务</h2><section class="panel">${taskTable(tasks)}</section>` : ''}<p class="notes" style="margin-top:20px">常驻服务的最近退出码是历史退出结果，当前是否运行以进程状态为准。</p>`;
+  return `${heading('后台服务', '观察常驻服务的运行情况，与业务定时任务分开展示。')}<div class="service-grid">${items.map((service) => `<section class="service-card"><div class="service-top"><h2>${esc(service.name)}</h2>${badge(service.state)}</div><p>${esc(service.description)}</p><div class="service-meta"><span>PID<strong>${service.pid ?? '—'}</strong></span><span>最近退出码<strong>${service.last_exit_code ?? '—'}</strong></span><span>加载<strong>${service.loaded ? '是' : '否'}</strong></span></div><div class="service-actions"><span class="secondary mono">${esc(service.label)}</span></div></section>`).join('')}</div>${tasks.length ? `<h2 class="system-heading">其他系统定时任务</h2><section class="panel">${taskTable(tasks)}</section>` : ''}<p class="notes" style="margin-top:20px">常驻服务的最近退出码是历史退出结果，当前是否运行以进程状态为准。</p>`;
+}
+
+function configurationPage() {
+  const items = state.configItems ?? [];
+  const sourceText = { launchd: 'launchd 定时任务', service: 'launchd 后台服务', external: '旧版登记任务' };
+  return `${heading('本机任务', '管理当前用户 launchd 定时任务和后台服务；命令可手动填写，也可选择 AI 脚本。', 'LOCAL / TASKS')}
+    <section class="panel"><div class="panel-heading"><div><h2>launchd 配置<span class="count-pill">${items.length}</span></h2><p class="panel-description">保存会备份原定义并应用到 launchd。运行中的任务不会默认被停止。</p></div><div class="management-buttons"><button class="button primary" data-config-create="launchd">新建定时任务</button><button class="button" data-config-create="service">新建后台服务</button><button class="button" data-config-retry>刷新</button><a class="button" href="#ai-scripts">AI 脚本库</a></div></div>
+    ${state.configError ? `<div class="notice">${esc(state.configError)} <button class="button" data-config-retry>重试</button></div>` : items.length ? `<div class="table-wrap"><table class="task-table config-table"><thead><tr><th>任务</th><th>来源</th><th>实际状态</th><th>命令 / 执行计划</th><th>管理</th></tr></thead><tbody>${items.map((item) => {
+      const execution = item.execution;
+      const schedule = execution?.schedule;
+      const plan = schedule ? ({ interval: `每 ${schedule.seconds} 秒`, daily: `每天 ${schedule.time}`, weekly: `每周 ${(schedule.weekdays ?? []).map((day) => '日一二三四五六'[day % 7]).join('、')} ${schedule.time}`, manual: '手动或事件触发', calendar: '日历规则', combined: '间隔与日历规则' })[schedule.type] : item.schedule;
+      const command = execution ? execution.program || execution.arguments?.[0] : item.script;
+      return `<tr><td><strong>${esc(item.name)}</strong><span class="secondary mono">${esc(item.id)}</span></td><td>${sourceText[item.source] ?? esc(item.source)}</td><td><span class="badge ${item.enabled ? 'ready' : 'unknown'}">${item.source === 'external' ? item.enabled ? '展示中' : '已隐藏' : item.enabled ? '已启用' : '已停用 / 未加载'}</span>${item.pid ? `<span class="secondary">运行中 · PID ${item.pid}</span>` : ''}</td><td><span>${esc(plan || (item.source === 'service' ? '常驻服务' : '历史外部调度'))}</span><span class="secondary mono">${esc(command || '未设置命令')}</span></td><td>${item.source === 'external' ? '<span class="secondary">旧登记</span>' : `<button class="button" data-config-edit="${esc(item.id)}">编辑</button>`}${item.managed ? ` <button class="button danger" data-config-delete="${esc(item.id)}">删除</button>` : ''}</td></tr>`;
+    }).join('')}</tbody></table></div>` : empty(state.configItems === null ? '正在读取实际任务配置…' : '暂无本机任务，可以在页面新建任务')}
+    <div class="panel-foot">${icon('info')}自动发现的系统任务可编辑和停用；删除仅对本页面创建的托管任务开放。启用 RunAtLoad 或 KeepAlive 可能立即启动任务。</div></section>`;
+}
+
+function aiScriptsPage() {
+  return `${heading('AI 脚本库', '选择 AI 提供商和模型，用提示词生成可复用脚本；任务可引用已保存的脚本。', 'AI / REUSABLE SCRIPTS')}
+    <section class="panel"><div class="panel-heading"><div><h2>可复用脚本<span class="count-pill">${state.aiScripts.length}</span></h2><p class="panel-description">测试会执行临时脚本副本并展示输出；临时目录在测试后删除，不会覆盖正式脚本。</p></div><button class="button primary" data-ai-script-create>新建 AI 脚本</button></div>
+    ${state.aiScripts.length ? `<div class="table-wrap"><table class="task-table"><thead><tr><th>脚本</th><th>提供商 / 模型</th><th>脚本文件</th><th>管理</th></tr></thead><tbody>${state.aiScripts.map((script) => `<tr><td><strong>${esc(script.name)}</strong><span class="secondary mono">${esc(script.id)}</span></td><td>${esc(script.provider)} · ${esc(script.model)}</td><td class="mono">${esc(script.output_path)}</td><td><button class="button" data-ai-script-edit="${esc(script.id)}">编辑</button> <button class="button" data-ai-script-test="${esc(script.id)}">测试</button> <button class="button danger" data-ai-script-delete="${esc(script.id)}">删除</button></td></tr>`).join('')}</tbody></table></div>` : empty('还没有 AI 脚本')}<div class="panel-foot">将脚本关联到现有任务：<code>python3 taskctl.py use-ai-script &lt;launchd-label&gt; &lt;script-id&gt;</code>；解除关联并恢复原命令：<code>python3 taskctl.py clear-ai-script &lt;launchd-label&gt;</code>。</div></section>`;
+}
+
+function editAiScript(script = {}) {
+  const providers = state.aiProviders.length ? state.aiProviders : [{ id: 'codex', name: 'Codex', model_hint: 'gpt-6.1-sol' }];
+  const defaultProvider = providers[0];
+  const item = { id: '', name: '', provider: defaultProvider.id, model: defaultProvider.model_hint, script_type: 'python', prompt: '', output_path: '', max_output_bytes: 1048576, timeout_seconds: 3600, ...script };
+  state.scriptTestOutput = null;
+  const provider = providers.find((candidate) => candidate.id === item.provider) ?? defaultProvider;
+  document.querySelector('#config-content').innerHTML = `<form id="ai-script-form" class="config-form" data-source="ai-script"><div class="dialog-heading"><div><div class="eyebrow">AI SCRIPT / PROVIDER</div><h2 id="config-title">${item.id ? '编辑 AI 脚本' : '新建 AI 脚本'}</h2></div><button type="button" class="icon-button" data-config-close aria-label="关闭">${icon('close')}</button></div><input type="hidden" name="id" value="${esc(item.id)}"><div class="config-body"><label>脚本名称<input name="name" required maxlength="120" value="${esc(item.name)}"></label><label>脚本 ID<input name="script_id" required maxlength="80" pattern="[a-z0-9][a-z0-9._-]{1,79}" value="${esc(item.id)}" placeholder="例如 daily-summary"${item.id ? ' readonly' : ''}></label><label>AI 提供商<select name="provider">${options(providers.map((candidate) => [candidate.id, candidate.name]), item.provider)}</select></label><label>模型名称<input name="model" required value="${esc(item.model)}" placeholder="${esc(provider.model_hint)}"></label><label>生成脚本类型<select name="script_type">${options([['python', 'Python'], ['shell', 'Shell']], item.script_type)}</select></label><label>生成脚本保存路径<input name="output_path" required value="${esc(item.output_path)}" placeholder="/Users/用户名/任务脚本/daily.py"></label><label>提示词<textarea name="prompt" rows="12" required maxlength="100000" placeholder="描述要生成的脚本及其输入、输出、错误处理要求">${esc(item.prompt)}</textarea></label><label>测试命令超时秒数<input name="timeout_seconds" type="number" min="1" max="86400" value="${item.timeout_seconds}"></label><label>最大生成字节数<input name="max_output_bytes" type="number" min="1" max="10485760" value="${item.max_output_bytes}"></label><div class="ai-test-result" id="ai-test-result" hidden></div></div><div class="config-actions"><button type="button" class="button" data-config-close>关闭</button><button type="button" class="button" data-ai-test-current>手动测试</button><button type="button" class="button" data-ai-save-output disabled>写入脚本文件</button><button type="submit" class="button primary">保存配置</button></div></form>`;
+  document.querySelector('#config-dialog').showModal();
+  document.querySelector('[name=name]').focus();
+}
+
+async function loadConfiguration() {
+  if (state.configLoading) return configurationRequest;
+  state.configLoading = true;
+  state.configError = '';
+  configurationRequest = (async () => {
+    try {
+      const result = await api('/api/configuration');
+      state.configItems = result.items;
+    } catch (error) {
+      state.configError = '读取实际配置失败：' + error.message;
+      toast(state.configError);
+    } finally {
+      state.configLoading = false;
+      configurationRequest = null;
+      if (location.hash === '#configuration') main.innerHTML = configurationPage();
+    }
+  })();
+  return configurationRequest;
+}
+
+function argumentRow(value = '') {
+  return `<div class="argument-row"><textarea data-argument rows="1" aria-label="命令参数" spellcheck="false">${esc(value)}</textarea><button type="button" class="icon-button" data-argument-remove aria-label="删除此参数">${icon('close')}</button></div>`;
+}
+
+function environmentRow(entry = {}) {
+  return `<div class="environment-row" data-retained="${entry.retained ? 'true' : 'false'}" data-original-key="${esc(entry.key ?? '')}"><input data-env-key aria-label="环境变量名" value="${esc(entry.key ?? '')}" placeholder="变量名" spellcheck="false"><input type="password" data-env-value aria-label="环境变量值" value="" autocomplete="new-password" placeholder="${entry.retained ? '已设置，留空保留原值' : '变量值'}"><button type="button" class="icon-button" data-env-remove aria-label="删除此环境变量">${icon('close')}</button></div>`;
+}
+
+function executionFields(item, source) {
+  const execution = item?.execution ?? { program: '', arguments: [''], working_directory: '', environment: [], stdout_path: '', stderr_path: '', run_at_load: false, keep_alive: source === 'service', schedule: { type: source === 'service' ? 'manual' : 'interval', seconds: 3600 } };
+  const schedule = execution.schedule;
+  const complexKeepAlive = typeof execution.keep_alive === 'object';
+  const commandRows = (execution.arguments?.length ? execution.arguments : ['']).map(argumentRow).join('');
+  const commandField = `<fieldset><legend>执行脚本</legend><label>选择 AI 脚本（可留空，手动填写下方命令）<select name="ai_script_id" data-ai-script-select>${options([['', '手动输入命令'], ...state.aiScripts.map((script) => [script.id, `${script.name} · ${script.provider} / ${script.model}`])], execution.ai_script_id ?? item?.ai_script_id ?? '')}</select></label><p class="form-help">手动模式直接编辑可执行文件和参数；选择 AI 脚本后使用脚本库中的本机文件。</p><div data-manual-command-fields><div class="form-label">命令参数</div><p class="form-help">每一行是一个参数，第一行为可执行文件绝对路径；保留空格和多行参数。</p><div id="argument-rows">${commandRows}</div><button type="button" class="button" data-argument-add>添加参数</button><label>可执行文件覆盖（Program，可选）<input name="program" value="${esc(execution.program)}" placeholder="留空时使用命令第一项" spellcheck="false"></label><label>工作目录<input name="working_directory" value="${esc(execution.working_directory)}" placeholder="本机绝对目录路径" spellcheck="false"></label></div></fieldset>`;
+  return `${commandField}
+    <fieldset><legend>实际调度规则</legend><label>调度方式<select name="schedule_type">${options([['interval', '固定间隔'], ['daily', '每天'], ['weekly', '每周 / 工作日'], ['calendar', '自定义日历规则'], ['combined', '间隔与日历共同触发'], ['manual', '手动或事件触发']], schedule.type)}</select></label><label data-schedule-field="interval combined">间隔秒数<input name="interval_seconds" type="number" min="1" max="2147483647" step="1" value="${esc(schedule.seconds ?? 3600)}"></label><label data-schedule-field="daily weekly">本机执行时间<input name="schedule_time" type="time" value="${esc(schedule.time ?? '09:00')}"></label><div class="weekday-choices" data-schedule-field="weekly" role="group" aria-label="执行星期">${[1,2,3,4,5,6,0].map((day) => `<label><input type="checkbox" name="weekday" value="${day}"${(schedule.weekdays ?? [1,2,3,4,5]).includes(day) ? ' checked' : ''}>周${'日一二三四五六'[day]}</label>`).join('')}</div><label data-schedule-field="calendar combined">StartCalendarInterval 日历规则<textarea name="calendar_rules" rows="5" spellcheck="false">${esc(JSON.stringify(schedule.rules ?? [{ Hour: 9, Minute: 0 }], null, 2))}</textarea><span class="form-help">支持 Minute、Hour、Day、Weekday、Month。复杂原规则会完整保留。</span></label><label class="config-check"><input type="checkbox" name="run_at_load"${execution.run_at_load ? ' checked' : ''}>加载时执行一次（RunAtLoad）</label><label>进程保活（KeepAlive）<select name="keep_alive">${options([['false', '关闭，按调度或事件启动'], ['true', '开启，进程退出后自动重新启动'], ...(complexKeepAlive ? [['preserve', '保留现有条件规则']] : [])], complexKeepAlive ? 'preserve' : String(execution.keep_alive))}</select></label></fieldset>
+    <fieldset><legend>环境与日志</legend><p class="form-help">已有环境变量不回显值，留空保留；移除一行会删除该变量。</p><div id="environment-rows">${execution.environment.map(environmentRow).join('')}</div><button type="button" class="button" data-env-add>添加环境变量</button><label>标准输出日志（StandardOutPath）<input name="stdout_path" value="${esc(execution.stdout_path)}" placeholder="本机日志绝对路径，可留空" spellcheck="false"></label><label>标准错误日志（StandardErrorPath）<input name="stderr_path" value="${esc(execution.stderr_path)}" placeholder="本机日志绝对路径，可留空" spellcheck="false"></label></fieldset>`;
+}
+
+function scheduleVisibility(form) {
+  const type = form.elements.schedule_type?.value;
+  form.querySelectorAll('[data-schedule-field]').forEach((node) => {
+    node.hidden = !node.dataset.scheduleField.split(' ').includes(type);
+    node.querySelectorAll('input,textarea').forEach((field) => { field.disabled = node.hidden; });
+  });
+}
+
+function updateScriptSelection(form) {
+  const selected = Boolean(form.elements.ai_script_id?.value);
+  const fields = form.querySelector('[data-manual-command-fields]');
+  if (fields) {
+    fields.classList.toggle('muted-fields', selected);
+    fields.querySelectorAll('input,textarea,button').forEach((control) => { control.disabled = selected; });
+  }
+}
+
+function editConfiguration(taskId = '', source = 'launchd') {
+  const item = state.configItems?.find((entry) => entry.id === taskId);
+  if (taskId && !item) { toast('该任务已变更，请刷新配置列表'); return; }
+  if (item?.source === 'external') { toast('旧版外部登记不能修改实际 launchd 配置'); return; }
+  source = item?.source ?? source;
+  const content = document.querySelector('#config-content');
+  content.innerHTML = `<form id="task-config-form" class="config-form" data-source="${source}"><div class="dialog-heading"><div><div class="eyebrow">LAUNCHD CONFIGURATION</div><h2 id="config-title">${item ? '编辑实际任务配置' : source === 'service' ? '新建后台服务' : '新建定时任务'}</h2></div><button type="button" class="icon-button" data-config-close aria-label="关闭">${icon('close')}</button></div><input type="hidden" name="id" value="${esc(item?.id ?? '')}"><input type="hidden" name="revision" value="${esc(item?.revision ?? '')}"><div class="config-body"><label>名称<input name="name" maxlength="120" required value="${esc(item?.name ?? '')}" placeholder="任务名称"></label><label>说明<textarea name="description" maxlength="1000" rows="2">${esc(item?.description ?? '')}</textarea></label>${executionFields(item, source)}<label class="config-check"><input type="checkbox" name="enabled"${item?.enabled === false ? '' : ' checked'}>启用实际 launchd 任务</label>${item?.pid ? `<div class="notice">当前进程 PID ${item.pid} 正在运行。保存配置不会默认停止它；如确需重启，请明确勾选。<label class="config-check"><input type="checkbox" name="restart_running">允许停止当前进程并重新加载</label></div>` : ''}${item?.definition_path ? `<p class="form-help mono">实际定义：${esc(item.definition_path)}</p>` : ''}<p id="config-error" class="form-error" role="alert" hidden></p></div><div class="panel-foot">保存会备份原定义、修改实际 plist 并重新加载；执行记录不会删除。</div><div class="config-actions"><button type="button" class="button" data-config-close>取消</button><button type="submit" class="button primary">${item ? '保存并应用' : '创建并应用'}</button></div></form>`;
+  const form = content.querySelector('form');
+  scheduleVisibility(form);
+  updateScriptSelection(form);
+  configDialog.showModal();
+  form.querySelector('[name="name"]').focus();
+}
+
+async function openConfigurationForm(taskId = '', source = 'launchd') {
+  if (state.aiScriptsLoaded !== true) await loadAiScripts();
+  editConfiguration(taskId, source);
+}
+
+async function saveConfiguration(form) {
+  const button = form.querySelector('[type="submit"]');
+  const errorNode = form.querySelector('#config-error');
+  if (button.disabled) return;
+  errorNode.hidden = true;
+  try {
+    const fields = form.elements;
+    const id = fields.id.value;
+    const source = form.dataset.source;
+    const schedule = { type: fields.schedule_type.value };
+    if (['interval', 'combined'].includes(schedule.type)) schedule.seconds = Number(fields.interval_seconds.value);
+    if (['daily', 'weekly'].includes(schedule.type)) schedule.time = fields.schedule_time.value;
+    if (schedule.type === 'weekly') schedule.weekdays = [...form.querySelectorAll('[name="weekday"]:checked')].map((node) => Number(node.value));
+    if (['calendar', 'combined'].includes(schedule.type)) {
+      try { schedule.rules = JSON.parse(fields.calendar_rules.value); } catch { throw new Error('日历规则不是有效 JSON，请检查格式'); }
+    }
+    const original = state.configItems?.find((item) => item.id === id);
+    const execution = { program: fields.program.value, ai_script_id: fields.ai_script_id.value || '',
+      arguments: [...form.querySelectorAll('[data-argument]')].map((node) => node.value), working_directory: fields.working_directory.value,
+      stdout_path: fields.stdout_path.value, stderr_path: fields.stderr_path.value,
+      environment: [...form.querySelectorAll('.environment-row')].map((row) => ({ key: row.querySelector('[data-env-key]').value,
+        value: row.querySelector('[data-env-value]').value, retained: row.dataset.retained === 'true' && row.dataset.originalKey === row.querySelector('[data-env-key]').value })),
+      run_at_load: fields.run_at_load.checked, keep_alive: fields.keep_alive.value === 'preserve' ? original?.execution.keep_alive : fields.keep_alive.value === 'true', schedule };
+    const body = { source, name: fields.name.value, description: fields.description.value, enabled: fields.enabled.checked,
+      revision: fields.revision.value, restart_running: fields.restart_running?.checked ?? false, execution };
+    button.disabled = true;
+    button.textContent = id ? '正在应用…' : '正在创建…';
+    const result = await api('/api/configuration' + (id ? '/' + encodeURIComponent(id) : ''), {
+      method: id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) });
+    configDialog.close();
+    state.configItems = null;
+    await loadConfiguration();
+    await refresh();
+    toast(result.applied ? '实际配置已应用到 launchd' : '配置已保存');
+  } catch (error) {
+    errorNode.textContent = error.message;
+    errorNode.hidden = false;
+    errorNode.scrollIntoView?.({ block: 'nearest' });
+  } finally {
+    button.disabled = false;
+    button.textContent = form.elements.id.value ? '保存并应用' : '创建并应用';
+  }
+}
+
+async function loadAiScripts() {
+  try {
+    const result = await api('/api/ai-scripts');
+    state.aiScripts = result.items;
+    state.aiProviders = result.providers;
+    state.aiScriptsLoaded = true;
+    if (location.hash === '#ai-scripts') main.innerHTML = aiScriptsPage();
+  } catch (error) { toast('AI 脚本读取失败：' + error.message); }
+}
+
+function aiScriptPayload(form) {
+  const fields = form.elements;
+  return { id: fields.script_id.value.trim(), name: fields.name.value.trim(), provider: fields.provider.value,
+    model: fields.model.value.trim(), script_type: fields.script_type.value, output_path: fields.output_path.value.trim(),
+    prompt: fields.prompt.value, timeout_seconds: Number(fields.timeout_seconds.value),
+    max_output_bytes: Number(fields.max_output_bytes.value) };
+}
+
+async function saveAiScriptConfig(form) {
+  try {
+    const result = await api('/api/ai-scripts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(aiScriptPayload(form)) });
+    form.elements.id.value = result.id;
+    state.aiScriptsLoaded = false;
+    await loadAiScripts();
+    toast('AI 脚本配置已保存');
+    return true;
+  } catch (error) { toast('保存 AI 脚本失败：' + error.message); return false; }
+}
+
+async function testAiScriptForm(form) {
+  if (!await saveAiScriptConfig(form)) return;
+  const id = form.elements.id.value;
+  const resultNode = form.querySelector('#ai-test-result');
+  resultNode.hidden = false;
+  const provider = state.aiProviders.find((item) => item.id === form.elements.provider.value);
+  resultNode.textContent = `正在运行 ${provider?.name ?? 'AI'} 测试…`;
+  const saveButton = form.querySelector('[data-ai-save-output]');
+  saveButton.disabled = true;
+  try {
+    const timeout = (Number(form.elements.timeout_seconds.value) + 30) * 1000;
+    const result = await api('/api/ai-scripts/' + encodeURIComponent(id) + '/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(timeout) });
+    state.scriptTestOutput = result.output;
+    state.scriptTestId = result.test_id;
+    const executionOutput = result.execution_output || result.execution_stderr || '脚本没有输出';
+    const executionSummary = result.execution_exit_code === null || result.execution_exit_code === undefined ? '' : `<div class="execution-result"><strong>脚本执行 · ${result.execution_timed_out ? '超时' : result.execution_exit_code === 0 ? '成功' : '失败'} · 退出码 ${result.execution_exit_code}${result.execution_output_truncated ? ' · 输出超限' : ''}</strong><pre>${esc(executionOutput)}</pre></div>`;
+    resultNode.innerHTML = `<strong>${result.ok ? '测试完成' : '测试失败'} · 生成退出码 ${result.generation_exit_code ?? result.exit_code}${result.output_truncated ? ' · 源码超限，不能保存' : ''}</strong>${result.validation_error ? `<p>${esc(result.validation_error)}</p>` : ''}<div class="generated-source"><strong>生成源码</strong><pre>${esc(result.output || '没有生成源码')}</pre></div>${executionSummary}${result.stderr ? `<details><summary>生成阶段标准错误</summary><pre>${esc(result.stderr)}</pre></details>` : ''}`;
+    saveButton.disabled = !result.test_id;
+  } catch (error) {
+    state.scriptTestOutput = null;
+    resultNode.textContent = '测试失败：' + error.message;
+  }
+}
+
+async function saveAiScriptOutput(form) {
+  if (!state.scriptTestOutput) return;
+  try {
+    const id = form.elements.id.value;
+    const result = await api('/api/ai-scripts/' + encodeURIComponent(id) + '/save-output', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ test_id: state.scriptTestId }) });
+    state.aiScriptsLoaded = false;
+    await loadAiScripts();
+    toast('脚本已写入 ' + result.path);
+  } catch (error) { toast('写入脚本失败：' + error.message); }
 }
 
 function currentTaskId() {
@@ -206,9 +402,11 @@ function render() {
   const taskId = currentTaskId();
   const route = taskId ? 'task' : location.hash.slice(1) || 'overview';
   document.querySelectorAll('[data-nav]').forEach((node) => node.classList.toggle('active', node.dataset.nav === (route === 'task' ? 'overview' : route)));
-  document.querySelector('#breadcrumb').textContent = route === 'task' ? taskName(taskId) : ({ overview: '任务总览', history: '执行记录', services: '后台服务' })[route] ?? '任务总览';
+  document.querySelector('#breadcrumb').textContent = route === 'task' ? taskName(taskId) : ({ overview: '任务总览', history: '执行记录', services: '后台服务', configuration: '本机任务', 'ai-scripts': 'AI 脚本' })[route] ?? '任务总览';
   if (route === 'history') main.innerHTML = heading('执行记录', '每一次运行的结果，都有据可查。', 'MAC MINI / RUN HISTORY') + historyPanel();
   else if (route === 'services') main.innerHTML = services();
+  else if (route === 'configuration') { main.innerHTML = configurationPage(); if (state.configItems === null) loadConfiguration(); }
+  else if (route === 'ai-scripts') { main.innerHTML = aiScriptsPage(); if (state.aiScriptsLoaded !== true) loadAiScripts(); }
   else if (route === 'task') {
     const task = state.data.tasks.find((item) => item.id === taskId);
     main.innerHTML = task ? detail(task) : heading('任务不存在', '该任务可能已移除，返回总览查看当前任务。') + '<a class="button" href="#overview">返回总览</a>';
@@ -275,6 +473,34 @@ document.addEventListener('click', (event) => {
   if (target.closest('#retry')) { refresh(true); return; }
   if (target.closest('#close-dialog')) { dialog.close(); return; }
   if (target.closest('#refresh-dialog')) { showRun(state.dialogRun, false); return; }
+  if (target.closest('[data-config-close]')) { configDialog.close(); return; }
+  if (target.closest('[data-ai-script-create]')) { editAiScript(); return; }
+  const scriptEdit = target.closest('[data-ai-script-edit]');
+  if (scriptEdit) { api('/api/ai-scripts/' + encodeURIComponent(scriptEdit.dataset.aiScriptEdit)).then(editAiScript).catch((error) => toast(error.message)); return; }
+  const scriptTest = target.closest('[data-ai-script-test]');
+  if (scriptTest) { api('/api/ai-scripts/' + encodeURIComponent(scriptTest.dataset.aiScriptTest)).then((script) => { editAiScript(script); setTimeout(() => testAiScriptForm(document.querySelector('#ai-script-form')), 0); }).catch((error) => toast(error.message)); return; }
+  const scriptDelete = target.closest('[data-ai-script-delete]');
+  if (scriptDelete && window.confirm('删除这个 AI 脚本？引用它的任务将无法继续执行。')) { api('/api/ai-scripts/' + encodeURIComponent(scriptDelete.dataset.aiScriptDelete), { method: 'DELETE' }).then(() => { state.aiScriptsLoaded = false; loadAiScripts(); toast('AI 脚本已删除'); }).catch((error) => toast(error.message)); return; }
+  if (target.closest('[data-ai-test-current]')) { testAiScriptForm(target.closest('form')); return; }
+  if (target.closest('[data-ai-save-output]')) { saveAiScriptOutput(target.closest('form')); return; }
+  if (target.closest('[data-config-retry]')) { state.configItems = null; loadConfiguration(); return; }
+  const create = target.closest('[data-config-create]');
+  if (create) { openConfigurationForm('', create.dataset.configCreate); return; }
+  const edit = target.closest('[data-config-edit]');
+  if (edit) { openConfigurationForm(edit.dataset.configEdit); return; }
+  const remove = target.closest('[data-config-delete]');
+  if (remove) {
+    const item = state.configItems?.find((entry) => entry.id === remove.dataset.configDelete);
+    if (!item || !window.confirm('删除此页面创建的 launchd 任务并卸载调度？执行历史保留。')) return;
+    api('/api/configuration/' + encodeURIComponent(item.id) + '?revision=' + encodeURIComponent(item.revision), { method: 'DELETE' })
+      .then(async () => { state.configItems = null; await loadConfiguration(); await refresh(); toast('任务已删除，执行历史保留'); })
+      .catch((error) => toast('删除失败：' + error.message));
+    return;
+  }
+  if (target.closest('[data-argument-add]')) { document.querySelector('#argument-rows').insertAdjacentHTML('beforeend', argumentRow()); return; }
+  if (target.closest('[data-argument-remove]')) { target.closest('.argument-row').remove(); return; }
+  if (target.closest('[data-env-add]')) { document.querySelector('#environment-rows').insertAdjacentHTML('beforeend', environmentRow()); return; }
+  if (target.closest('[data-env-remove]')) { target.closest('.environment-row').remove(); return; }
   const run = target.closest('[data-run]');
   if (run) { showRun(run.dataset.run); return; }
   const task = target.closest('[data-task]');
@@ -285,15 +511,40 @@ document.addEventListener('click', (event) => {
   if (page && !page.disabled) { state.offset = Math.max(0, state.offset + (page.dataset.page === 'next' ? 30 : -30)); loadHistory(currentTaskId()); }
 });
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && configDialog.open) { configDialog.close(); return; }
   if ((event.key === 'Enter' || event.key === ' ') && event.target instanceof Element && event.target.matches('[data-run]')) {
     event.preventDefault(); showRun(event.target.dataset.run);
   }
 });
 document.addEventListener('change', (event) => {
   const target = event.target;
+  if (target.name === 'schedule_type') scheduleVisibility(target.form);
+  if (target.matches('[data-ai-script-select]')) updateScriptSelection(target.form);
+  if (target.name === 'provider') {
+    const provider = state.aiProviders.find((item) => item.id === target.value);
+    if (provider && target.form?.elements.model) target.form.elements.model.placeholder = provider.model_hint;
+    if (target.form?.id === 'ai-script-form' && state.scriptTestId) {
+      state.scriptTestId = null;
+      state.scriptTestOutput = null;
+      target.form.querySelector('[data-ai-save-output]').disabled = true;
+      target.form.querySelector('#ai-test-result').textContent = '配置已修改，请重新手动测试。';
+    }
+  }
   if (target instanceof HTMLSelectElement && target.dataset.filter) { state.filters[target.dataset.filter] = target.value; state.offset = 0; loadHistory(currentTaskId()); }
 });
+document.addEventListener('submit', (event) => {
+  if (event.target instanceof HTMLFormElement && event.target.getAttribute('id') === 'ai-script-form') { event.preventDefault(); saveAiScriptConfig(event.target); return; }
+  if (event.target instanceof HTMLFormElement && event.target.getAttribute('id') === 'task-config-form') { event.preventDefault(); saveConfiguration(event.target); return; }
+});
 document.addEventListener('input', (event) => {
+  if (event.target.closest?.('#ai-script-form') && state.scriptTestId) {
+    state.scriptTestOutput = null;
+    state.scriptTestId = null;
+    const save = document.querySelector('[data-ai-save-output]');
+    if (save) save.disabled = true;
+    const result = document.querySelector('#ai-test-result');
+    if (result) result.textContent = '配置已修改，请重新手动测试。';
+  }
   if (event.target.id === 'task-search') {
     state.taskSearch = event.target.value;
     clearTimeout(searchTimer);
@@ -304,6 +555,7 @@ document.addEventListener('input', (event) => {
   }
 });
 dialog.addEventListener('click', (event) => { if (event.target === dialog) { const box = dialog.getBoundingClientRect(); if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) dialog.close(); } });
+configDialog.addEventListener('click', (event) => { if (event.target === configDialog) { const box = configDialog.getBoundingClientRect(); if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) configDialog.close(); } });
 refresh();
 setInterval(() => { if (!document.hidden) refresh(); }, 15000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });

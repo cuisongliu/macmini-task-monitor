@@ -24,6 +24,7 @@ import collector
 import config
 import install
 import ai_scripts
+import feishu_notifications
 import launchd_config
 import taskctl
 from fake_launchd import FakeLaunchd
@@ -35,7 +36,7 @@ from http.server import ThreadingHTTPServer
 class MonitorTests(unittest.TestCase):
     def setUp(self):
         with store.connect() as db:
-            db.executescript('DROP TABLE IF EXISTS runs;DROP TABLE IF EXISTS tasks;DROP TABLE IF EXISTS metadata;DROP TABLE IF EXISTS task_configs;DROP TABLE IF EXISTS ai_scripts;')
+            db.executescript('DROP TABLE IF EXISTS runs;DROP TABLE IF EXISTS tasks;DROP TABLE IF EXISTS metadata;DROP TABLE IF EXISTS task_configs;DROP TABLE IF EXISTS ai_scripts;DROP TABLE IF EXISTS notification_states;DROP TABLE IF EXISTS notification_deliveries;')
         store.initialize()
         self.agent_directory = tempfile.TemporaryDirectory(prefix='test-launchagents-')
         self.addCleanup(self.agent_directory.cleanup)
@@ -67,6 +68,118 @@ class MonitorTests(unittest.TestCase):
         self.assertGreaterEqual(row['duration'], 0)
         self.assertIn('运行完成 中文', row['log_tail'])
         self.assertNotIn('fake-test-value', row['log_tail'])
+
+    def test_feishu_webhook_transport_and_signature(self):
+        captured = {}
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self, _limit): return b'{"code":0}'
+        def opener(request, timeout):
+            captured['url'] = request.full_url
+            captured['body'] = json.loads(request.data)
+            captured['timeout'] = timeout
+            return Response()
+        result = feishu_notifications.send_webhook('任务失败', 'https://open.feishu.cn/open-apis/bot/v2/hook/test-token', 'test-secret', opener=opener)
+        self.assertEqual(result['code'], 0)
+        self.assertEqual(captured['body']['content']['text'], '任务失败')
+        self.assertTrue(captured['body']['sign'])
+        self.assertNotIn('secret', json.dumps(captured['body']))
+
+    def test_feishu_rejects_non_feishu_webhook(self):
+        with self.assertRaises(feishu_notifications.FeishuError):
+            feishu_notifications.send_webhook('test', 'https://example.com/open-apis/bot/token')
+
+    def test_notification_config_masks_secrets_and_preserves_blank_values(self):
+        import notifications
+        original = {'channels': [{'id': 'mail', 'type': 'email', 'enabled': True, 'events': ['failed'],
+                                  'smtp_host': 'smtp.example.test', 'smtp_port': 465, 'security': 'ssl',
+                                  'from': 'monitor@example.test', 'to': ['ops@example.test'],
+                                  'username': 'monitor', 'password': 'local-secret'}]}
+        masked = notifications.public(original)
+        self.assertNotIn('local-secret', json.dumps(masked))
+        self.assertTrue(masked['channels'][0]['password_configured'])
+        updated = notifications.validate({'channels': [masked['channels'][0]]}, original)
+        self.assertEqual(updated['channels'][0]['password'], 'local-secret')
+
+    def test_notifications_api_requires_origin_and_masks_credentials(self):
+        import notifications
+        original = {'channels': [{'id': 'hook', 'type': 'feishu_webhook', 'enabled': True, 'events': ['failed'],
+                                  'webhook_url': 'https://open.feishu.cn/open-apis/bot/v2/hook/local-secret', 'secret': 'sign-secret'}]}
+        store.save_notification_config(original)
+        http = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        http.allowed_hosts = {'127.0.0.1'}
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        base = f'http://127.0.0.1:{http.server_port}'
+        with urlopen(base + '/api/notifications') as response:
+            result = json.loads(response.read())
+        self.assertNotIn('local-secret', json.dumps(result))
+        self.assertNotIn('sign-secret', json.dumps(result))
+        payload = json.dumps({'channels': []}).encode()
+        with self.assertRaises(HTTPError) as error:
+            urlopen(Request(base + '/api/notifications', method='PUT', data=payload,
+                            headers={'Host': '127.0.0.1', 'Content-Type': 'application/json'}))
+        self.assertEqual(error.exception.code, 403)
+
+    def test_notification_test_endpoint_uses_current_form_without_saving(self):
+        import notifications
+        store.save_notification_config({'channels': []})
+        http = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        http.allowed_hosts = {'127.0.0.1'}
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        base = f'http://127.0.0.1:{http.server_port}'
+        payload = {'id': 'mail-test', 'type': 'email', 'events': ['failed'], 'enabled': True,
+                   'smtp_host': 'smtp.example.test', 'smtp_port': 465, 'security': 'ssl',
+                   'from': 'monitor@example.test', 'to': ['ops@example.test']}
+        headers = {'Host': '127.0.0.1', 'Origin': base, 'Content-Type': 'application/json'}
+        with patch.object(notifications, 'send_channel') as send_channel:
+            response = urlopen(Request(base + '/api/notifications/test', method='POST',
+                                       data=json.dumps(payload).encode(), headers=headers))
+            self.assertEqual(response.status, 200)
+        self.assertIn('测试通知', send_channel.call_args.args[1])
+        self.assertEqual(store.get_notification_config(), {'channels': []})
+
+    def test_incident_policy_merges_failures_reminds_recovers_and_limits(self):
+        import notifications
+        rule = {'enabled': True, 'channels': ['ops'], 'events': ['failed', 'interrupted'], 'mode': 'incident',
+                'cooldown_seconds': 1800, 'reminder_seconds': 14400, 'notify_recovery': True, 'max_per_hour': 3}
+        channels = {'channels': [{'id': 'ops', 'type': 'email', 'enabled': True,
+                                  'events': ['failed', 'interrupted'], 'smtp_host': 'mock'}]}
+        with patch.object(notifications, 'send_channel') as sender:
+            self.assertEqual(notifications.notify_task('incident-task', rule, channels, 'failed', '异常', now=10000)[0], 1)
+            self.assertEqual(notifications.notify_task('incident-task', rule, channels, 'failed', '再次异常', now=11000)[0], 0)
+            self.assertEqual(notifications.notify_task('incident-task', rule, channels, 'failed', '持续异常', now=24400)[0], 1)
+            self.assertIn('连续故障 3 次', sender.call_args.args[1])
+            self.assertEqual(notifications.notify_task('incident-task', rule, channels, 'success', '恢复', now=25000)[0], 1)
+            self.assertIn('recovered', sender.call_args.args[1])
+        state = store.get_notification_state('incident-task')
+        self.assertFalse(state['active'])
+        self.assertEqual(state['failure_count'], 0)
+
+    def test_notification_task_and_global_hourly_limits(self):
+        import notifications
+        rule = {'enabled': True, 'channels': ['ops'], 'events': ['failed', 'success'], 'mode': 'every_run',
+                'cooldown_seconds': 1, 'reminder_seconds': 1, 'notify_recovery': True, 'max_per_hour': 1}
+        channels = {'channels': [{'id': 'ops', 'type': 'email', 'enabled': True, 'events': ['failed', 'success']}]}
+        with patch.object(notifications, 'send_channel') as sender:
+            self.assertEqual(notifications.notify_task('limit-task', rule, channels, 'success', 'one', now=50000)[0], 1)
+            self.assertEqual(notifications.notify_task('limit-task', rule, channels, 'success', 'two', now=50001)[0], 0)
+        self.assertEqual(sender.call_count, 1)
+
+    def test_feishu_notification_failure_does_not_change_task_exit(self):
+        import notifications
+        with patch.dict(os.environ, {'TASK_MONITOR_FEISHU_EVENTS': 'failed',
+                                     'TASK_MONITOR_FEISHU_WEBHOOK': 'https://open.feishu.cn/open-apis/bot/v2/hook/test'}), \
+             patch.object(notifications, 'send_channel', side_effect=RuntimeError('network error')):
+            result = self.runner('import sys;sys.exit(9)', task_id='notify-test')
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(self.latest('notify-test')['status'], 'failed')
 
     def test_worker_result_is_not_overwritten_by_idle(self):
         result = self.runner('print(\'{"event":"worker_finished","pr":123,"code":0,"status":"processed"}\');print(\'{"event":"worker_idle"}\')')

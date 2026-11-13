@@ -15,6 +15,7 @@ from pathlib import Path
 
 import collector
 import store
+import notifications
 from config import AGENTS, DATA, ROOT, redact
 
 LOCK = threading.RLock()
@@ -319,6 +320,7 @@ def metadata(body, source, original=None):
         value['ai_script_id'] = script_id
     else:
         value.pop('ai_script_id', None)
+    value['notification'] = notifications.validate_task_rule(body.get('notification', (original or {}).get('notification')))
     return value
 
 

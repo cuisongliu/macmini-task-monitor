@@ -1,100 +1,114 @@
-/** 在 DOM 模拟器中检查真实接口驱动的页面导航、筛选与日志；不控制本机浏览器。 */
+/** 真浏览器 + 真实 Handler/SQLite/plist；launchctl 全部模拟，不连接业务任务。 */
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
+const { spawn, execFileSync } = require('node:child_process');
 const path = require('node:path');
-
-const dependencyRoot = '/Volumes/code/dev/FastGPT/node_modules/.pnpm';
-const installed = fs.existsSync(dependencyRoot) ? fs.readdirSync(dependencyRoot).find((entry) => entry.startsWith('jsdom@')) : null;
-const { JSDOM, VirtualConsole } = require(process.env.JSDOM_PATH ?? (installed ? path.join(dependencyRoot, installed, 'node_modules/jsdom') : 'jsdom'));
-const base = process.env.MONITOR_URL ?? 'http://127.0.0.1:8765';
-const errors = [];
-const virtualConsole = new VirtualConsole();
-virtualConsole.on('jsdomError', (error) => errors.push(error.message));
-
-async function until(callback, message) {
-  const started = Date.now();
-  while (!callback()) {
-    if (Date.now() - started > 12000) throw new Error(message);
-    await new Promise((resolve) => setTimeout(resolve, 40));
-  }
-}
+const fs = require('node:fs');
+const root = path.resolve(__dirname, '..');
+const session = `mini-config-${process.pid}`;
+const screenshotDirectory = path.join(root, '.context');
+fs.mkdirSync(screenshotDirectory, { recursive: true });
+const chrome = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const browser = (args) => execFileSync('agent-browser', ['--session', session, ...args], { cwd: root, encoding: 'utf8', timeout: 45000, maxBuffer: 4 * 1024 * 1024 });
+const evaluate = (code) => browser(['eval', code]);
+const wait = (code) => browser(['wait', '--fn', code]);
+const fill = (selector, text) => browser(['fill', selector, text]);
+const click = (selector) => browser(['click', selector]);
+const select = (selector, value) => browser(['select', selector, value]);
+const http = spawn(process.env.PYTHON || 'python3', ['tests/ui_server.py'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+let stderr = '';
+http.stderr.on('data', (value) => { stderr += value; });
+const ready = new Promise((resolve, reject) => {
+  let output = '';
+  const timeout = setTimeout(() => reject(new Error('测试服务未就绪：' + stderr)), 10000);
+  http.stdout.on('data', (chunk) => {
+    output += chunk;
+    if (!output.includes('\n')) return;
+    clearTimeout(timeout);
+    try { resolve(JSON.parse(output.split('\n')[0]).base); } catch (error) { reject(error); }
+  });
+  http.on('exit', (code) => { clearTimeout(timeout); if (code) reject(new Error('测试服务退出：' + stderr)); });
+});
 
 (async () => {
-  const source = await fetch(base + '/api/overview').then((response) => response.json());
-  const expectedBalance = source.tasks.find((task) => task.id === 'metaso-balance').data.balance;
-  const expectedBackupFiles = source.tasks.find((task) => task.id === 'fastgpt-backup').data.latest_backup.file_count;
-  const dom = await JSDOM.fromURL(base, {
-    runScripts: 'dangerously', resources: 'usable', pretendToBeVisual: true, virtualConsole,
-    beforeParse(window) {
-      window.fetch = (url, options) => fetch(new URL(url, window.location.href), options);
-      window.AbortSignal = globalThis.AbortSignal;
-      window.scrollTo = () => {};
-      window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
-      window.HTMLDialogElement.prototype.close = function () { this.open = false; };
-    }
-  });
-  const w = dom.window;
-  const document = w.document;
-  const change = (select, value) => { select.value = value; select.dispatchEvent(new w.Event('change', { bubbles: true })); };
   try {
-    await until(() => document.querySelectorAll('#task-rows tr').length === 5, '总览未显示五个业务任务');
-    assert.equal(document.querySelector('h1').textContent, '任务总览');
-    assert.equal(document.querySelectorAll('.stats .stat').length, 4);
-    assert.ok(document.querySelector('#sync-status').textContent.includes('已同步'));
-    assert.ok(source.recent.every((run) => run.status !== 'skipped'));
+    const base = await ready;
+    await fetch(base + '/_test/disable-ai-api');
+    browser(['--executable-path', chrome, 'open', base + '/#configuration']);
+    wait("document.querySelector('#main').textContent.includes('com.example.timer')");
+    evaluate("if(!document.querySelector('[data-config-create=launchd]') || !document.querySelector('[data-config-edit]')) throw new Error('launchd 配置页缺少管理入口'); if(!document.body.textContent.includes('手动填写') || !document.body.textContent.includes('AI 脚本')) throw new Error('任务管理说明未显示')");
+    evaluate("if(document.querySelector('#main').textContent.includes('读取实际配置失败')) throw new Error('任务列表不应依赖 AI 脚本接口')");
+    let state = await (await fetch(base + '/_test/state')).json();
+    assert.equal(state.ai_api_requests, 0);
+    assert(!state.calls.some((call) => ['bootstrap', 'bootout', 'enable', 'disable'].includes(call[0])));
 
-    const search = document.querySelector('#task-search');
-    search.value = 'PR'; search.dispatchEvent(new w.Event('input', { bubbles: true }));
-    await until(() => document.querySelectorAll('#task-rows tr').length === 3, '任务搜索无效');
-    console.log('PASS 总览、统计、任务搜索');
+    // AI 接口暂不可用时仍可创建普通任务，命令逐项手动填写。
+    evaluate("document.querySelector('[data-config-create=launchd]').click()");
+    wait("document.querySelector('#task-config-form')", 5000);
+    fill('[name=name]', '页面手动任务');
+    fill('[data-argument]', '/usr/bin/printf');
+    evaluate("document.querySelector('[data-argument-add]').click(); document.querySelectorAll('[data-argument]')[1].value='created from page'");
+    click('#task-config-form [type=submit]');
+    wait("document.querySelector('#main').textContent.includes('页面手动任务')", 5000);
+    state = await (await fetch(base + '/_test/state')).json();
+    const manualTask = Object.keys(state.configurations).find((id) => state.configurations[id].name === '页面手动任务');
+    assert(manualTask);
+    let manualDefinition = state.definitions.find((item) => item.Label === manualTask);
+    assert.deepEqual(manualDefinition.ProgramArguments, ['/usr/bin/printf', 'created from page']);
+    assert(state.calls.some((call) => call[0] === 'bootstrap' && call[2].endsWith(manualTask + '.plist')));
 
-    w.location.hash = '#task/metaso-balance';
-    await until(() => document.querySelector('h1')?.textContent === '秘塔搜索余额' && document.querySelectorAll('#history-content tbody tr').length > 0, '秘塔详情未加载');
-    assert.ok(document.querySelector('.business-value').textContent.includes(new Intl.NumberFormat('en-US').format(expectedBalance)));
-    document.querySelector('[data-logs]').click();
-    await until(() => document.querySelector('#task-logs pre')?.textContent.includes('运行记录'), '原始日志未加载');
-    assert.ok(!document.querySelector('#task-logs').textContent.includes('FEISHU_WEBHOOK_URL'));
-    console.log('PASS 秘塔详情、余额、历史记录、按需读取日志');
+    // 创建的托管任务可以从页面删除，历史记录之外的临时定义不会残留。
+    evaluate("window.confirm=()=>true; document.querySelector('[data-config-delete=" + JSON.stringify(manualTask) + "]').click()");
+    wait("!document.querySelector('[data-config-delete=" + JSON.stringify(manualTask) + "]')", 5000);
+    state = await (await fetch(base + '/_test/state')).json();
+    assert(!state.definitions.some((item) => item.Label === manualTask));
 
-    w.location.hash = '#history';
-    await until(() => document.querySelector('h1')?.textContent === '执行记录' && document.querySelector('#history-content tbody'), '记录页面未加载');
-    assert.equal(document.querySelector('[data-filter="status"]').value, 'non_skipped');
-    assert.equal(document.querySelectorAll('#history-content .badge.skipped').length, 0);
-    change(document.querySelector('[data-filter="status"]'), 'success');
-    await until(() => document.querySelectorAll('#history-content tbody tr').length > 0 && [...document.querySelectorAll('#history-content tbody .badge')].every((node) => node.classList.contains('success')), '结果筛选无效');
-    change(document.querySelector('[data-filter="status"]'), 'skipped');
-    await until(() => document.querySelectorAll('#history-content tbody tr').length > 0 && [...document.querySelectorAll('#history-content tbody .badge')].every((node) => node.classList.contains('skipped')), '手动查看跳过记录无效');
-    change(document.querySelector('[data-filter="kind"]'), 'execution');
-    await until(() => document.querySelectorAll('#history-content tbody tr').length > 0 && [...document.querySelectorAll('#history-content tbody tr')].every((node) => node.textContent.includes('实时采集')), '来源筛选无效');
-    document.querySelector('#history-content [data-run]').click();
-    await until(() => document.querySelector('#run-dialog').open, '执行详情未打开');
-    assert.ok(document.querySelector('#dialog-content').textContent.includes('本次执行日志'));
-    assert.ok(document.querySelector('#dialog-content pre').textContent.length > 0);
-    document.querySelector('#close-dialog').click();
-    assert.equal(document.querySelector('#run-dialog').open, false);
-    console.log('PASS 默认隐藏跳过、手动查看跳过记录、结果/来源筛选、详情弹层、逐次日志');
+    await fetch(base + '/_test/enable-ai-api');
+    click('a[href="#ai-scripts"]');
+    wait("document.querySelector('[data-ai-script-create]')");
+    evaluate("document.querySelector('[data-ai-script-create]').click()");
+    wait("document.querySelector('#ai-script-form')", 5000);
+    fill('[name=name]', '页面 Codex 脚本');
+    fill('[name=script_id]', 'page-codex');
+    fill('[name=model]', 'gpt-6.1-sol');
+    fill('[name=output_path]', state.ai_output_path);
+    fill('[name=prompt]', '只生成测试脚本');
+    evaluate("window.__aiTimeouts=[]; const originalTimeout=AbortSignal.timeout.bind(AbortSignal); AbortSignal.timeout=(ms)=>{window.__aiTimeouts.push(ms);return originalTimeout(ms)}");
+    click('[data-ai-test-current]');
+    wait("document.querySelector('#ai-test-result').textContent.includes('测试完成')");
+    evaluate("if(!window.__aiTimeouts.includes(3630000)) throw new Error('AI 测试请求超时未跟随脚本配置')");
+    evaluate("if(!document.querySelector('#ai-test-result').textContent.includes('脚本执行 · 成功')) throw new Error('生成脚本未实际执行或未显示执行结果')");
+    click('[data-ai-save-output]');
+    wait("document.querySelector('#toast').textContent.includes('脚本已写入')");
+    state = await (await fetch(base + '/_test/state')).json();
+    assert.equal(state.generated_script, "print('generated from prompt')\n");
+    browser(['screenshot', path.join(screenshotDirectory, 'ai-script-library.png')]);
+    click('[data-config-close]');
 
-    change(document.querySelector('[data-filter="kind"]'), '');
-    change(document.querySelector('[data-filter="status"]'), '');
-    change(document.querySelector('[data-filter="days"]'), '0');
-    await until(() => document.querySelector('#history-content tbody tr') && !document.querySelector('[data-page="next"]').disabled, '分页未显示');
-    document.querySelector('[data-page="next"]').click();
-    await until(() => document.querySelector('.pagination').textContent.includes('当前 31'), '下一页失效');
-    console.log('PASS 历史分页');
-
-    w.location.hash = '#task/fastgpt-backup';
-    await until(() => document.querySelector('h1')?.textContent === 'FastGPT 数据备份', '备份详情未加载');
-    assert.match(document.querySelector('.business-value').textContent, /(?:MB|GB)/);
-    assert.ok(document.querySelector('.business-card').textContent.includes(String(expectedBackupFiles)));
-    w.location.hash = '#task/pr-report';
-    await until(() => document.querySelector('h1')?.textContent === 'PR 审查日报', '日报详情未加载');
-    assert.ok(document.querySelector('.report-list tbody tr'));
-    w.location.hash = '#services';
-    await until(() => document.querySelectorAll('.service-card').length === source.collector.services.length, '服务状态未显示');
-    assert.ok(document.querySelector('.system-heading').textContent.includes('系统定时任务'));
-    assert.deepEqual(errors, []);
-    console.log('PASS 备份产物、日报内容、常驻服务、系统定时任务；无前端运行错误');
+    // 已保存的脚本可以在任务表单中直接选择，后端把本机脚本作为入口写入 plist。
+    browser(['open', base + '/#configuration']);
+    wait("document.querySelector('[data-config-edit=\"com.example.timer\"]')", 5000);
+    click('[data-config-edit="com.example.timer"]');
+    wait("document.querySelector('#task-config-form')", 5000);
+    select('[name=ai_script_id]', 'page-codex');
+    browser(['screenshot', path.join(screenshotDirectory, 'task-management.png')]);
+    click('#task-config-form [type=submit]');
+    wait("document.querySelector('#main').textContent.includes('com.example.timer')", 5000);
+    state = await (await fetch(base + '/_test/state')).json();
+    let task = state.definitions.find((item) => item.Label === 'com.example.timer');
+    assert.deepEqual(task.ProgramArguments, [state.python_path, state.ai_output_path]);
+    assert.equal(state.configurations['com.example.timer'].ai_script_id, 'page-codex');
+    const cleared = await fetch(base + '/_test/clear-script');
+    assert.equal(cleared.status, 200);
+    state = await (await fetch(base + '/_test/state')).json();
+    task = state.definitions.find((item) => item.Label === 'com.example.timer');
+    assert.deepEqual(task.ProgramArguments, ['/usr/bin/printf', '任务参数 with spaces']);
+    assert(!state.configurations['com.example.timer'].ai_script_id);
+    console.log('PASS 任务页面新建/删除、手动命令和 AI 脚本关联、AI 脚本配置/模拟测试/文件写入、原命令恢复；仅临时 SQLite/plist 和模拟工具。');
+  } catch (error) {
+    try { console.error(evaluate("JSON.stringify({error:document.querySelector('#config-error')?.textContent,dialog:document.querySelector('#config-dialog')?.open,title:document.querySelector('h1')?.textContent,form:!!document.querySelector('#ai-script-form'),result:document.querySelector('#ai-test-result')?.textContent,toast:document.querySelector('#toast')?.textContent,html:document.querySelector('#main')?.innerText?.slice(0,300)})")); } catch {}
+    throw error;
   } finally {
-    w.close();
+    try { browser(['close']); } catch {}
+    http.kill('SIGTERM');
   }
-})().catch((error) => { console.error(error); process.exitCode = 1; });
+})().catch((error) => { console.error(error.message); process.exitCode = 1; });

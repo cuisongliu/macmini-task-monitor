@@ -45,6 +45,12 @@ def initialize():
             CREATE INDEX IF NOT EXISTS runs_time ON runs(created_at DESC);
             CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS task_configs (
+                task_id TEXT PRIMARY KEY, config TEXT NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ai_scripts (
+                script_id TEXT PRIMARY KEY, config TEXT NOT NULL, updated_at REAL NOT NULL
+            );
         ''')
         db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)', ('created_at', json.dumps(time.time())))
     os.chmod(DB_PATH, 0o600)
@@ -62,6 +68,42 @@ def get_meta(key, default=None):
     return json.loads(row['value']) if row else default
 
 
+def get_task_configs():
+    with connect() as db:
+        rows = db.execute('SELECT task_id,config FROM task_configs').fetchall()
+    return {row['task_id']: json.loads(row['config']) for row in rows}
+
+
+def save_task_config(task_id, config):
+    with connect() as db:
+        db.execute('''INSERT INTO task_configs VALUES (?,?,?)
+            ON CONFLICT(task_id) DO UPDATE SET config=excluded.config,updated_at=excluded.updated_at''',
+                   (task_id, json.dumps(config, ensure_ascii=False), time.time()))
+
+
+def delete_task_config(task_id):
+    with connect() as db:
+        db.execute('DELETE FROM task_configs WHERE task_id=?', (task_id,))
+
+
+def get_ai_scripts():
+    with connect() as db:
+        rows = db.execute('SELECT script_id,config FROM ai_scripts').fetchall()
+    return {row['script_id']: json.loads(row['config']) for row in rows}
+
+
+def save_ai_script(script_id, config):
+    with connect() as db:
+        db.execute('''INSERT INTO ai_scripts VALUES (?,?,?)
+            ON CONFLICT(script_id) DO UPDATE SET config=excluded.config,updated_at=excluded.updated_at''',
+                   (script_id, json.dumps(config, ensure_ascii=False), time.time()))
+
+
+def delete_ai_script(script_id):
+    with connect() as db:
+        db.execute('DELETE FROM ai_scripts WHERE script_id=?', (script_id,))
+
+
 def backup_database(name):
     """历史结果修正前保存一次 WAL 一致快照；写完后原子发布，避免保留半份备份。"""
     folder = DATA / 'backups'
@@ -76,6 +118,10 @@ def backup_database(name):
     try:
         with connect() as source:
             source.backup(target)
+        # Backups are opened read-only by maintenance checks. Keep them self-contained
+        # instead of leaving WAL sidecars beside a snapshot that may be copied away.
+        target.execute('PRAGMA journal_mode=DELETE')
+        target.commit()
     finally:
         target.close()
     os.chmod(temporary, 0o600)

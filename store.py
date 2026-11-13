@@ -51,6 +51,14 @@ def initialize():
             CREATE TABLE IF NOT EXISTS ai_scripts (
                 script_id TEXT PRIMARY KEY, config TEXT NOT NULL, updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS notification_states (
+                task_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+                event TEXT NOT NULL, sent_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS notification_delivery_time ON notification_deliveries(sent_at);
         ''')
         db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)', ('created_at', json.dumps(time.time())))
     os.chmod(DB_PATH, 0o600)
@@ -102,6 +110,60 @@ def save_ai_script(script_id, config):
 def delete_ai_script(script_id):
     with connect() as db:
         db.execute('DELETE FROM ai_scripts WHERE script_id=?', (script_id,))
+
+
+def get_notification_config():
+    return get_meta('notifications', {'channels': []})
+
+
+def save_notification_config(config):
+    set_meta('notifications', config)
+
+
+def get_notification_state(task_id):
+    with connect() as db:
+        row = db.execute('SELECT state FROM notification_states WHERE task_id=?', (task_id,)).fetchone()
+    return json.loads(row['state']) if row else {}
+
+
+def save_notification_state(task_id, state):
+    with connect() as db:
+        db.execute('''INSERT INTO notification_states VALUES (?,?,?)
+            ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at''',
+                   (task_id, json.dumps(state, ensure_ascii=False), time.time()))
+
+
+def count_notification_deliveries(since):
+    with connect() as db:
+        return db.execute('SELECT count(*) FROM notification_deliveries WHERE sent_at>=?', (since,)).fetchone()[0]
+
+
+def count_task_notification_deliveries(task_id, since):
+    with connect() as db:
+        return db.execute('SELECT count(*) FROM notification_deliveries WHERE task_id=? AND sent_at>=?', (task_id, since)).fetchone()[0]
+
+
+def record_notification_delivery(task_id, channel_id, event, sent_at=None):
+    import uuid
+    with connect() as db:
+        db.execute('INSERT INTO notification_deliveries VALUES (?,?,?,?,?)',
+                   (uuid.uuid4().hex, task_id, channel_id, event, sent_at or time.time()))
+
+
+def reserve_notification_delivery(task_id, channel_id, event, sent_at, task_limit, global_limit):
+    """Atomically enforce limits across concurrent runner processes."""
+    import uuid
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        since = sent_at - 3600
+        task_count = db.execute('SELECT count(*) FROM notification_deliveries WHERE task_id=? AND sent_at>=?',
+                                (task_id, since)).fetchone()[0]
+        global_count = db.execute('SELECT count(*) FROM notification_deliveries WHERE sent_at>=?', (since,)).fetchone()[0]
+        if task_count >= task_limit or global_count >= global_limit:
+            return False
+        db.execute('INSERT INTO notification_deliveries VALUES (?,?,?,?,?)',
+                   (uuid.uuid4().hex, task_id, channel_id, event, sent_at))
+        return True
 
 
 def backup_database(name):

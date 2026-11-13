@@ -36,7 +36,7 @@ const duration = (value) => value === null || value === undefined ? '未知' : v
 const sourceLabel = (run) => run.kind === 'history' ? '历史凭据' : '实时采集';
 const taskName = (id) => state.data?.tasks.find((task) => task.id === id)?.name ?? id;
 const taskHref = (id) => `#task/${encodeURIComponent(id)}`;
-const state = { data: null, route: '', taskSearch: '', filters: { task_id: '', status: 'non_skipped', kind: '', days: '7', search: '' }, offset: 0, history: null, historyTicket: 0, logs: new Map(), shownLogs: new Set(), loading: false, dialogRun: null, configItems: null, aiScripts: [], aiProviders: [], configLoading: false, configError: '' };
+const state = { data: null, route: '', taskSearch: '', filters: { task_id: '', status: 'non_skipped', kind: '', days: '7', search: '' }, offset: 0, history: null, historyTicket: 0, logs: new Map(), shownLogs: new Set(), loading: false, dialogRun: null, configItems: null, aiScripts: [], aiProviders: [], notificationChannels: [], configLoading: false, configError: '' };
 const main = document.querySelector('#main');
 const dialog = document.querySelector('#run-dialog');
 const configDialog = document.querySelector('#config-dialog');
@@ -118,6 +118,74 @@ function historyFilters(taskId) {
 
 function historyPanel(taskId = '') {
   return `<section class="panel"><div class="panel-heading"><div><h2>执行记录</h2><p class="panel-description">默认隐藏跳过记录；可通过结果筛选查看全部</p></div>${historyFilters(taskId)}</div><div id="history-content" aria-live="polite">${empty('正在读取执行记录…')}</div><div class="panel-foot">${icon('info')}历史凭据不是完整执行历史。没有可靠时间的记录显示“未知”，不会补成零耗时。</div></section>`;
+}
+
+const notificationTypes = [['feishu_webhook', '飞书自定义机器人'], ['feishu_app', '飞书应用机器人'], ['email', '邮件（SMTP）']];
+const notificationEvents = [['success', '成功'], ['failed', '失败'], ['interrupted', '中断'], ['skipped', '跳过']];
+function notificationChannel(item = {}, index = 0) {
+  const type = item.type ?? 'feishu_webhook';
+  const checked = (event) => (item.events ?? ['failed']).includes(event) ? ' checked' : '';
+  const secretHint = (key) => item[key + '_configured'] ? '已配置，留空保留' : '请输入';
+  return `<fieldset class="notification-channel" data-notification-channel><legend>通知渠道 ${index + 1}</legend><div class="notification-top"><label>渠道名称<input data-field="id" required maxlength="80" value="${esc(item.id ?? '')}" placeholder="例如：值班群"></label><label>通知方式<select data-field="type">${options(notificationTypes, type)}</select></label><label class="config-check"><input data-field="enabled" type="checkbox"${item.enabled === false ? '' : ' checked'}>启用</label><button type="button" class="icon-button" data-notification-test aria-label="测试通知渠道" title="发送测试通知">${icon('pulse')}</button><button type="button" class="icon-button" data-notification-remove aria-label="删除通知渠道" title="删除通知渠道">${icon('close')}</button></div><div class="notification-events"><span class="form-label">触发通知</span>${notificationEvents.map(([value, text]) => `<label><input data-event="${value}" type="checkbox"${checked(value)}> ${text}</label>`).join('')}</div><div data-notification-kind="feishu_webhook"><p class="form-help">飞书群聊：群设置 → 群机器人 → 添加自定义机器人，然后复制 Webhook 地址。</p><label>Webhook 地址<input data-field="webhook_url" type="url" value="" placeholder="${secretHint('webhook_url')}"></label><label>签名密钥（可选）<input data-field="secret" type="password" value="" autocomplete="new-password" placeholder="${secretHint('secret')}"></label></div><div data-notification-kind="feishu_app"><p class="form-help">应用机器人需要飞书开放平台的 App ID、App Secret，并配置发送消息权限。</p><label>App ID<input data-field="app_id" value="${esc(item.app_id ?? '')}" placeholder="cli_xxx"></label><label>App Secret<input data-field="app_secret" type="password" value="" autocomplete="new-password" placeholder="${secretHint('app_secret')}"></label><label>接收方 ID<input data-field="receive_id" value="${esc(item.receive_id ?? '')}" placeholder="用户 open_id 或群 chat_id"></label><label>接收方类型<select data-field="receive_id_type">${options([['open_id', 'open_id'], ['user_id', 'user_id'], ['union_id', 'union_id'], ['email', 'email'], ['chat_id', 'chat_id']], item.receive_id_type ?? 'open_id')}</select></label></div><div data-notification-kind="email"><p class="form-help">填写邮件服务商提供的 SMTP 主机、端口和安全方式；常见服务商通常要求 SSL 或 STARTTLS。</p><label>SMTP 主机<input data-field="smtp_host" value="${esc(item.smtp_host ?? '')}" placeholder="smtp.example.com"></label><div class="form-grid"><label>端口<input data-field="smtp_port" type="number" min="1" max="65535" value="${esc(item.smtp_port ?? 465)}"></label><label>安全方式<select data-field="security">${options([['ssl', 'SSL'], ['starttls', 'STARTTLS'], ['plain', '明文（不推荐）']], item.security ?? 'ssl')}</select></label></div><label>发件人<input data-field="from" type="email" value="${esc(item.from ?? '')}" placeholder="monitor@example.com"></label><label>收件人（多个用逗号分隔）<input data-field="to" value="${esc((item.to ?? []).join(', '))}" placeholder="ops@example.com"></label><label>SMTP 用户名（可选）<input data-field="username" value="${esc(item.username ?? '')}"></label><label>SMTP 密码<input data-field="password" type="password" value="" autocomplete="new-password" placeholder="${secretHint('password')}"></label><label>邮件标题<input data-field="subject" value="${esc(item.subject ?? 'Mac mini 任务通知')}"></label></div></fieldset>`;
+}
+
+function updateNotificationKinds(channel) {
+  const type = channel.querySelector('[data-field="type"]')?.value;
+  channel.querySelectorAll('[data-notification-kind]').forEach((node) => { node.hidden = node.dataset.notificationKind !== type; });
+}
+
+function notificationsPage() {
+  return `${heading('通知设置', '用表单配置飞书和邮件通知', 'NOTIFICATIONS')}<section class="panel"><form id="notifications-form" class="config-form"><div class="panel-heading"><div><h2>通知渠道</h2><p class="panel-description">选择通知方式和触发事件。凭据不会回显，敏感字段留空会保留已保存值。</p></div><button type="button" class="button" data-notification-add>添加渠道</button></div><div id="notification-channels" class="config-body"><div class="empty">正在读取通知配置…</div></div><p id="notification-error" class="form-error" role="alert" hidden></p><div class="config-actions"><button type="submit" class="button primary">保存通知配置</button></div></form></section>`;
+}
+
+async function loadNotifications() {
+  try {
+    const config = await api('/api/notifications');
+    const target = document.querySelector('#notification-channels');
+    if (!target) return;
+    target.innerHTML = config.channels.length ? config.channels.map(notificationChannel).join('') : '<div class="empty">还没有通知渠道，点击“添加渠道”开始配置。</div>';
+    target.querySelectorAll('[data-notification-channel]').forEach(updateNotificationKinds);
+  } catch (error) { toast(error.message); }
+}
+
+function notificationPayload(form) {
+  return [...form.querySelectorAll('[data-notification-channel]')].map((channel) => {
+    const value = (name) => channel.querySelector(`[data-field="${name}"]`)?.value ?? '';
+    const item = { id: value('id').trim(), type: value('type'), enabled: channel.querySelector('[data-field="enabled"]').checked,
+      events: [...channel.querySelectorAll('[data-event]:checked')].map((node) => node.dataset.event) };
+    channel.querySelectorAll('[data-field]').forEach((field) => {
+      if (field.dataset.field !== 'id' && field.dataset.field !== 'type' && field.dataset.field !== 'enabled') item[field.dataset.field] = field.dataset.field === 'smtp_port' ? Number(field.value) : field.value.trim();
+    });
+    if (item.type === 'email') item.to = item.to.split(',').map((entry) => entry.trim()).filter(Boolean);
+    return item;
+  });
+}
+
+async function testNotificationChannel(channel) {
+  const payload = notificationPayload({ querySelectorAll: () => [channel] });
+  const button = channel.querySelector('[data-notification-test]');
+  button.disabled = true;
+  try {
+    await api('/api/notifications/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload[0]) });
+    toast('测试通知已发送');
+  } catch (error) {
+    toast('测试通知失败：' + error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function saveNotifications(form) {
+  const errorNode = form.querySelector('#notification-error');
+  try {
+    const channels = notificationPayload(form);
+    await api('/api/notifications', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channels }) });
+    toast('通知配置已保存');
+    await loadNotifications();
+  } catch (error) {
+    errorNode.textContent = error.message;
+    errorNode.hidden = false;
+  }
 }
 
 function runTable(result, taskId) {
@@ -262,13 +330,19 @@ function updateScriptSelection(form) {
   }
 }
 
+function taskNotificationFields(item) {
+  const rule = { enabled: false, channels: [], events: ['failed', 'interrupted'], mode: 'incident', cooldown_seconds: 1800,
+    reminder_seconds: 14400, notify_recovery: true, max_per_hour: 3, ...(item?.notification ?? {}) };
+  return `<fieldset><legend>任务通知策略</legend><label class="config-check"><input name="notify_enabled" type="checkbox"${rule.enabled ? ' checked' : ''}>为此任务启用通知</label><div data-notify-settings${rule.enabled ? '' : ' hidden'}><p class="form-help">故障首次发生时立即通知；连续故障会合并，持续故障按提醒间隔通知，恢复时发送一次恢复消息。</p><label>通知渠道</label><div class="weekday-choices">${state.notificationChannels.filter((channel) => channel.enabled !== false).map((channel) => `<label><input name="notify_channel" type="checkbox" value="${esc(channel.id)}"${rule.channels.includes(channel.id) ? ' checked' : ''}>${esc(channel.id)}</label>`).join('') || '<span class="form-help">还没有已启用的通知渠道。先到“通知设置”添加并保存渠道。</span>'}</div><div class="weekday-choices" aria-label="通知事件">${notificationEvents.map(([value, label]) => `<label><input name="notify_event" type="checkbox" value="${value}"${rule.events.includes(value) ? ' checked' : ''}>${label}</label>`).join('')}</div><label>通知频率<select name="notify_mode">${options([['incident', '故障合并（推荐）'], ['every_run', '每次匹配运行']], rule.mode)}</select></label><div class="form-grid"><label>重复故障冷却分钟<input name="notify_cooldown" type="number" min="1" max="10080" value="${Math.ceil(rule.cooldown_seconds / 60)}"></label><label>持续故障提醒小时<input name="notify_reminder" type="number" min="1" max="720" value="${Math.ceil(rule.reminder_seconds / 3600)}"></label></div><label class="config-check"><input name="notify_recovery" type="checkbox"${rule.notify_recovery ? ' checked' : ''}>故障恢复后通知一次</label><label>每小时最多通知<input name="notify_max_hour" type="number" min="1" max="20" value="${rule.max_per_hour}"></label><p class="form-help">全局另有每小时 20 条上限；超出会合并抑制，避免通知风暴。</p></div></fieldset>`;
+}
+
 function editConfiguration(taskId = '', source = 'launchd') {
   const item = state.configItems?.find((entry) => entry.id === taskId);
   if (taskId && !item) { toast('该任务已变更，请刷新配置列表'); return; }
   if (item?.source === 'external') { toast('旧版外部登记不能修改实际 launchd 配置'); return; }
   source = item?.source ?? source;
   const content = document.querySelector('#config-content');
-  content.innerHTML = `<form id="task-config-form" class="config-form" data-source="${source}"><div class="dialog-heading"><div><div class="eyebrow">LAUNCHD CONFIGURATION</div><h2 id="config-title">${item ? '编辑实际任务配置' : source === 'service' ? '新建后台服务' : '新建定时任务'}</h2></div><button type="button" class="icon-button" data-config-close aria-label="关闭">${icon('close')}</button></div><input type="hidden" name="id" value="${esc(item?.id ?? '')}"><input type="hidden" name="revision" value="${esc(item?.revision ?? '')}"><div class="config-body"><label>名称<input name="name" maxlength="120" required value="${esc(item?.name ?? '')}" placeholder="任务名称"></label><label>说明<textarea name="description" maxlength="1000" rows="2">${esc(item?.description ?? '')}</textarea></label>${executionFields(item, source)}<label class="config-check"><input type="checkbox" name="enabled"${item?.enabled === false ? '' : ' checked'}>启用实际 launchd 任务</label>${item?.pid ? `<div class="notice">当前进程 PID ${item.pid} 正在运行。保存配置不会默认停止它；如确需重启，请明确勾选。<label class="config-check"><input type="checkbox" name="restart_running">允许停止当前进程并重新加载</label></div>` : ''}${item?.definition_path ? `<p class="form-help mono">实际定义：${esc(item.definition_path)}</p>` : ''}<p id="config-error" class="form-error" role="alert" hidden></p></div><div class="panel-foot">保存会备份原定义、修改实际 plist 并重新加载；执行记录不会删除。</div><div class="config-actions"><button type="button" class="button" data-config-close>取消</button><button type="submit" class="button primary">${item ? '保存并应用' : '创建并应用'}</button></div></form>`;
+  content.innerHTML = `<form id="task-config-form" class="config-form" data-source="${source}"><div class="dialog-heading"><div><div class="eyebrow">LAUNCHD CONFIGURATION</div><h2 id="config-title">${item ? '编辑实际任务配置' : source === 'service' ? '新建后台服务' : '新建定时任务'}</h2></div><button type="button" class="icon-button" data-config-close aria-label="关闭">${icon('close')}</button></div><input type="hidden" name="id" value="${esc(item?.id ?? '')}"><input type="hidden" name="revision" value="${esc(item?.revision ?? '')}"><div class="config-body"><label>名称<input name="name" maxlength="120" required value="${esc(item?.name ?? '')}" placeholder="任务名称"></label><label>说明<textarea name="description" maxlength="1000" rows="2">${esc(item?.description ?? '')}</textarea></label>${executionFields(item, source)}${taskNotificationFields(item)}<label class="config-check"><input type="checkbox" name="enabled"${item?.enabled === false ? '' : ' checked'}>启用实际 launchd 任务</label>${item?.pid ? `<div class="notice">当前进程 PID ${item.pid} 正在运行。保存配置不会默认停止它；如确需重启，请明确勾选。<label class="config-check"><input type="checkbox" name="restart_running">允许停止当前进程并重新加载</label></div>` : ''}${item?.definition_path ? `<p class="form-help mono">实际定义：${esc(item.definition_path)}</p>` : ''}<p id="config-error" class="form-error" role="alert" hidden></p></div><div class="panel-foot">保存会备份原定义、修改实际 plist 并重新加载；执行记录不会删除。</div><div class="config-actions"><button type="button" class="button" data-config-close>取消</button><button type="submit" class="button primary">${item ? '保存并应用' : '创建并应用'}</button></div></form>`;
   const form = content.querySelector('form');
   scheduleVisibility(form);
   updateScriptSelection(form);
@@ -278,6 +352,9 @@ function editConfiguration(taskId = '', source = 'launchd') {
 
 async function openConfigurationForm(taskId = '', source = 'launchd') {
   if (state.aiScriptsLoaded !== true) await loadAiScripts();
+  if (!state.notificationChannels.length) {
+    try { state.notificationChannels = (await api('/api/notifications')).channels; } catch { state.notificationChannels = []; }
+  }
   editConfiguration(taskId, source);
 }
 
@@ -304,8 +381,15 @@ async function saveConfiguration(form) {
       environment: [...form.querySelectorAll('.environment-row')].map((row) => ({ key: row.querySelector('[data-env-key]').value,
         value: row.querySelector('[data-env-value]').value, retained: row.dataset.retained === 'true' && row.dataset.originalKey === row.querySelector('[data-env-key]').value })),
       run_at_load: fields.run_at_load.checked, keep_alive: fields.keep_alive.value === 'preserve' ? original?.execution.keep_alive : fields.keep_alive.value === 'true', schedule };
+    const notifyEnabled = fields.notify_enabled?.checked ?? false;
+    const notification = { enabled: notifyEnabled,
+      channels: [...form.querySelectorAll('[name="notify_channel"]:checked')].map((node) => node.value),
+      events: [...form.querySelectorAll('[name="notify_event"]:checked')].map((node) => node.value),
+      mode: fields.notify_mode?.value ?? 'incident', cooldown_seconds: Number(fields.notify_cooldown?.value ?? 30) * 60,
+      reminder_seconds: Number(fields.notify_reminder?.value ?? 4) * 3600, notify_recovery: fields.notify_recovery?.checked ?? true,
+      max_per_hour: Number(fields.notify_max_hour?.value ?? 3) };
     const body = { source, name: fields.name.value, description: fields.description.value, enabled: fields.enabled.checked,
-      revision: fields.revision.value, restart_running: fields.restart_running?.checked ?? false, execution };
+      revision: fields.revision.value, restart_running: fields.restart_running?.checked ?? false, execution, notification };
     button.disabled = true;
     button.textContent = id ? '正在应用…' : '正在创建…';
     const result = await api('/api/configuration' + (id ? '/' + encodeURIComponent(id) : ''), {
@@ -402,11 +486,12 @@ function render() {
   const taskId = currentTaskId();
   const route = taskId ? 'task' : location.hash.slice(1) || 'overview';
   document.querySelectorAll('[data-nav]').forEach((node) => node.classList.toggle('active', node.dataset.nav === (route === 'task' ? 'overview' : route)));
-  document.querySelector('#breadcrumb').textContent = route === 'task' ? taskName(taskId) : ({ overview: '任务总览', history: '执行记录', services: '后台服务', configuration: '本机任务', 'ai-scripts': 'AI 脚本' })[route] ?? '任务总览';
+  document.querySelector('#breadcrumb').textContent = route === 'task' ? taskName(taskId) : ({ overview: '任务总览', history: '执行记录', services: '后台服务', configuration: '本机任务', 'ai-scripts': 'AI 脚本', notifications: '通知设置' })[route] ?? '任务总览';
   if (route === 'history') main.innerHTML = heading('执行记录', '每一次运行的结果，都有据可查。', 'MAC MINI / RUN HISTORY') + historyPanel();
   else if (route === 'services') main.innerHTML = services();
   else if (route === 'configuration') { main.innerHTML = configurationPage(); if (state.configItems === null) loadConfiguration(); }
   else if (route === 'ai-scripts') { main.innerHTML = aiScriptsPage(); if (state.aiScriptsLoaded !== true) loadAiScripts(); }
+  else if (route === 'notifications') { main.innerHTML = notificationsPage(); loadNotifications(); }
   else if (route === 'task') {
     const task = state.data.tasks.find((item) => item.id === taskId);
     main.innerHTML = task ? detail(task) : heading('任务不存在', '该任务可能已移除，返回总览查看当前任务。') + '<a class="button" href="#overview">返回总览</a>';
@@ -483,6 +568,19 @@ document.addEventListener('click', (event) => {
   if (scriptDelete && window.confirm('删除这个 AI 脚本？引用它的任务将无法继续执行。')) { api('/api/ai-scripts/' + encodeURIComponent(scriptDelete.dataset.aiScriptDelete), { method: 'DELETE' }).then(() => { state.aiScriptsLoaded = false; loadAiScripts(); toast('AI 脚本已删除'); }).catch((error) => toast(error.message)); return; }
   if (target.closest('[data-ai-test-current]')) { testAiScriptForm(target.closest('form')); return; }
   if (target.closest('[data-ai-save-output]')) { saveAiScriptOutput(target.closest('form')); return; }
+  if (target.closest('[data-notification-add]')) {
+    const container = document.querySelector('#notification-channels');
+    if (container.querySelector('.empty')) container.innerHTML = '';
+    container.insertAdjacentHTML('beforeend', notificationChannel({ type: 'feishu_webhook', enabled: true, events: ['failed'] }, container.querySelectorAll('[data-notification-channel]').length));
+    updateNotificationKinds(container.lastElementChild);
+    container.lastElementChild.querySelector('[data-field="id"]').focus();
+    return;
+  }
+  if (target.closest('[data-notification-remove]')) {
+    target.closest('[data-notification-channel]').remove();
+    return;
+  }
+  if (target.closest('[data-notification-test]')) { testNotificationChannel(target.closest('[data-notification-channel]')); return; }
   if (target.closest('[data-config-retry]')) { state.configItems = null; loadConfiguration(); return; }
   const create = target.closest('[data-config-create]');
   if (create) { openConfigurationForm('', create.dataset.configCreate); return; }
@@ -518,6 +616,11 @@ document.addEventListener('keydown', (event) => {
 });
 document.addEventListener('change', (event) => {
   const target = event.target;
+  if (target.matches('[data-field="type"]')) updateNotificationKinds(target.closest('[data-notification-channel]'));
+  if (target.name === 'notify_enabled') {
+    const settings = target.form.querySelector('[data-notify-settings]');
+    if (settings) settings.hidden = !target.checked;
+  }
   if (target.name === 'schedule_type') scheduleVisibility(target.form);
   if (target.matches('[data-ai-script-select]')) updateScriptSelection(target.form);
   if (target.name === 'provider') {
@@ -533,6 +636,7 @@ document.addEventListener('change', (event) => {
   if (target instanceof HTMLSelectElement && target.dataset.filter) { state.filters[target.dataset.filter] = target.value; state.offset = 0; loadHistory(currentTaskId()); }
 });
 document.addEventListener('submit', (event) => {
+  if (event.target instanceof HTMLFormElement && event.target.id === 'notifications-form') { event.preventDefault(); saveNotifications(event.target); return; }
   if (event.target instanceof HTMLFormElement && event.target.getAttribute('id') === 'ai-script-form') { event.preventDefault(); saveAiScriptConfig(event.target); return; }
   if (event.target instanceof HTMLFormElement && event.target.getAttribute('id') === 'task-config-form') { event.preventDefault(); saveConfiguration(event.target); return; }
 });

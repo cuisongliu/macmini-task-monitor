@@ -73,6 +73,25 @@ AI 脚本库与普通任务分开管理。脚本配置包含 AI 提供商、模�
 - 日历任务显示计划时间；间隔任务根据最近启动时间估计，不能保证休眠、唤醒后的实际时刻。
 - SQLite 当前保留全部记录，不自动删除历史。原业务日志仍由原脚本负责维护。
 
+## 飞书通知
+
+runner 支持在任务结束后按状态发送飞书和邮件通知。打开页面的“通知设置”保存渠道即可；配置写入监控自己的 SQLite，读取接口不会返回凭据。每个渠道可单独启用并选择触发状态，未设置触发状态时不发送；通知失败不会改变业务退出码，也不会重试。配置示例：
+
+```text
+TASK_MONITOR_FEISHU_EVENTS=failed
+[{"id":"feishu","type":"feishu_webhook","enabled":true,"events":["failed"],"webhook_url":"https://open.feishu.cn/open-apis/bot/v2/hook/...","secret":"可选签名密钥"},{"id":"mail","type":"email","enabled":true,"events":["failed"],"smtp_host":"smtp.example.com","smtp_port":465,"security":"ssl","from":"monitor@example.com","to":["ops@example.com"],"username":"monitor","password":"SMTP 密码"}]
+```
+
+`events` 支持 `success`、`failed`、`interrupted`、`skipped`，多个状态直接写入数组。自定义机器人可配置签名密钥；传输层只接受飞书官方 HTTPS Webhook 域名。
+
+每个渠道卡片上的测试按钮会立即向该渠道发送一条“Mac mini 任务监控测试通知”，使用当前表单内容但不会保存配置；测试失败会显示接口错误类别或 SMTP/网络错误类型。
+
+飞书应用机器人渠道使用 `type: "feishu_app"`，并填写 `app_id`、`app_secret`、`receive_id`；接收方类型可设为 `open_id`（默认）、`user_id`、`union_id`、`email` 或 `chat_id`。应用需具备获取 tenant_access_token 与发送 IM 消息所需权限，并已能向目标接收方发消息。邮件支持 SMTP SSL、STARTTLS 和明文连接。
+
+通知正文仅包含任务 ID、最终状态和执行摘要，不包含日志。为兼容旧任务，仍支持 `TASK_MONITOR_FEISHU_*` 环境变量；数据库有通知配置时优先使用数据库配置。凭据只保存在本机，诊断输出会脱敏；不要把真实凭据写入代码或提交到仓库。可用本仓库测试验证通知封装，但不要用真实任务验证发送。
+
+任务是否通知在“本机任务”编辑表单中单独设置，默认关闭。推荐使用“故障合并”策略：首次失败或中断立即通知，连续故障按提醒间隔合并，恢复时只通知一次；默认冷却 30 分钟、持续故障提醒 4 小时、单任务每小时最多 3 条。监控全局每小时最多发送 20 条，超出的通知会记录为抑制，避免异常时通知风暴。通知状态和发送记录持久化在本机 SQLite，服务重启不会清空限流状态。
+
 ## 维护
 
 局部验证（使用临时 SQLite，不执行真实业务或发送通知）：

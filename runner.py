@@ -14,6 +14,7 @@ import uuid
 
 import store
 from config import redact
+import notifications
 from outcomes import scan_result, docs_result
 
 
@@ -167,6 +168,19 @@ def execute(options):
             summary = f'已处理 {len(business_results)} 个 PR' + (f'，其中 {len(failures)} 个异常' if failures else '')
     safe_record(lambda: store.update_run(run_id, status=status, finished_at=time.time(), heartbeat_at=time.time(),
                                         exit_code=code, summary=summary, log_tail=tail))
+    try:
+        notification_config = store.get_notification_config()
+        if not notification_config.get('channels'):
+            notification_config = notifications.environment_config()
+        task_config = store.get_task_configs().get(options.task_id, {})
+        sent, errors = notifications.notify_task(options.task_id, task_config.get('notification'),
+            notification_config, status, summary)
+        if sent:
+            print(f'[task-monitor] 通知已发送（{sent} 个渠道）', file=sys.stderr, flush=True)
+        if errors:
+            print('[task-monitor] 通知发送失败，原任务结果不变：' + redact('; '.join(errors)), file=sys.stderr, flush=True)
+    except Exception as error:
+        print('[task-monitor] 读取通知配置失败，原任务结果不变：' + redact(error), file=sys.stderr, flush=True)
     return 128 - code if code < 0 else code
 
 

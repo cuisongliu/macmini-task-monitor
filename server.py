@@ -17,6 +17,7 @@ import collector
 import ai_scripts
 import launchd_config
 import store
+import notifications
 from config import DB_PATH, ROOT, ZONE, redact
 
 
@@ -130,6 +131,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, configuration_snapshot())
             elif path == '/api/ai-scripts':
                 self.respond(200, ai_scripts.list_scripts())
+            elif path == '/api/notifications':
+                self.respond(200, notifications.public(store.get_notification_config()))
             elif path.startswith('/api/ai-scripts/'):
                 script_id = unquote(path[len('/api/ai-scripts/'):])
                 self.respond(200, {'id': script_id, **ai_scripts.get(script_id)})
@@ -192,6 +195,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_path = urlparse(self.path).path
+        if request_path == '/api/notifications/test':
+            if not self.authorize_request(require_origin=True):
+                return
+            try:
+                body = read_json_body(self)
+                existing = store.get_notification_config()
+                config = notifications.validate({'channels': [body]}, existing)
+                channel = config['channels'][0]
+                notifications.send_channel(channel, 'Mac mini 任务监控测试通知\n渠道：' + channel['id'])
+                self.respond(200, {'ok': True})
+            except Exception as error:
+                self.configuration_error(error)
+            return
         if request_path.startswith('/api/ai-scripts/') and request_path.endswith('/test'):
             if not self.authorize_request(require_origin=True):
                 return
@@ -245,6 +261,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = unquote(urlparse(self.path).path)
+        if path == '/api/notifications':
+            if not self.authorize_request(require_origin=True):
+                return
+            try:
+                body = read_json_body(self)
+                config = notifications.validate(body, store.get_notification_config())
+                store.save_notification_config(config)
+                self.respond(200, {'ok': True})
+            except Exception as error:
+                self.configuration_error(error)
+            return
         prefix = '/api/configuration/'
         if not path.startswith(prefix):
             self.respond(405, {'error': '只允许通过本机配置页面管理任务'})
